@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: Demo
+    database: Demo
+    schema: demo_schema
+    tables:
+      - name: BIKE
