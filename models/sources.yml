@@ -1,8 +1,11 @@
 version: 2
 
 sources:
-  - name: Demo
-    database: Demo
-    schema: demo_schema
+  - name: UserActions
+    database: RAW__FORGE__AOPC
+    schema: dbo
     tables:
-      - name: BIKE
+      - name: SUPERVISORACTIONS
+      - name: ARCHIVESUPERVISORACTIONS
+      - name: PACKET
+      - name: ARCHIVEPACKET
