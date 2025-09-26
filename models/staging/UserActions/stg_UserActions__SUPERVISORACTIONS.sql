@@ -2,7 +2,7 @@ with
 
 source as (
 
-    select * from {{ source('UserActions', 'SUPERVISORACTIONS') }}
+    select * from {{ source('DBT_SNOWFLAKE', 'SUPERVISORACTIONS') }}
 
 ),
 

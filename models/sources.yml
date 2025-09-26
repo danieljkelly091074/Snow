@@ -1,9 +1,9 @@
 version: 2
 
 sources:
-  - name: UserActions
+  - name: DBT_SNOWFLAKE
     database: RAW__FORGE__AOPC
-    schema: dbo
+    schema: DBO
     tables:
       - name: SUPERVISORACTIONS
       - name: ARCHIVESUPERVISORACTIONS
