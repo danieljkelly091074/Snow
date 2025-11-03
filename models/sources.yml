@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: DBT_SNOWFLAKE
+    database: RAW__FORGE__AOPC
+    schema: DBO
+    tables:
+      - name: SUPERVISORACTIONS
+      - name: ARCHIVESUPERVISORACTIONS
+      - name: PACKET
+      - name: ARCHIVEPACKET
+      - name: SITEDIM
+      - name: USER_DIM
+      - name: ACTIONDIM
