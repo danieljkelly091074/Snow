@@ -12,3 +12,14 @@ sources:
       - name: SITEDIM
       - name: USER_DIM
       - name: ACTIONDIM
+      - name: PACKETTYPE
+      - name: CUSTOMER
+      - name: METAL
+      - name: SERVICEDIM
+      - name: WEBHALLNOTE
+      - name: PACKETADDITIONALSERVICE 
+      - name: ARCHIVEPACKETADDITIONALSERVICE 
+      - name: PACKETITEM
+      - name: ARCHIVEPACKETITEM
+   
+      
