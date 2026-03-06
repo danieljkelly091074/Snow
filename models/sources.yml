@@ -21,5 +21,13 @@ sources:
       - name: ARCHIVEPACKETADDITIONALSERVICE 
       - name: PACKETITEM
       - name: ARCHIVEPACKETITEM
-   
-      
+      - name: PAYMENTS
+      - name: ARCHIVEPAYMENTS
+
+
+  - name: sharepoint
+    database: RAW__SHAREPOINT
+    schema: SHAREPOINT
+    tables:
+      - name: hallnotes
+  
