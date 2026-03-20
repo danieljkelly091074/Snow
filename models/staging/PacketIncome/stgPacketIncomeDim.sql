@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 WITH PacketIncome As (
 
 SELECT dbo.Packet.PacketID AS PacketKey, dbo.Packet.PacketNumber, CASE WHEN WebHallNote.PacketNumber IS NOT NULL THEN 1 ELSE 0 END AS OnlinePacket

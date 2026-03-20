@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 
 WITH MetalIncome As (
 SELECT MetalCode As MetalKey, MetalDescription 

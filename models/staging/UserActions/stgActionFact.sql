@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 WITH ActionFact As (
 
 SELECT DISTINCT SiteKey, PACKETID AS PacketKey, DateKey, UserKey, ActionKey, TotalItems, TotalSampled

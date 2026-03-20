@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 
 WITH Service As (
 SELECT ServiceID As ServiceKey, ServiceDescription, ExternalID, ServiceType 

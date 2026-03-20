@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 WITH PacketIncomeFact As (
 SELECT dbo.Packet.PacketID As PacketKey, TO_CHAR(dbo.Packet.Opened, 'YYYYMMDD')::INT AS DateKey, PacketTypeID AS SpeedOfServiceKey, ServiceKey, 
 TradesmanAccountCode As CustomerKey, dbo.Packet.MetalCode As MetalKey, SiteKey, Quantity, Price, dbo.Packet.VATRate      
