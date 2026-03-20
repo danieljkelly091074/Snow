@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: hallnotes_packetnumber
+    description: Parsed and enriched packet data extracted from hallnotes PDFs using AI_PARSE_DOCUMENT and Cortex LLM
+    columns:
+      - name: FILE_ID
+        description: Unique file identifier from SharePoint
+        tests:
+          - not_null
+          - unique
+      - name: PACKETNUMBER
+        description: Barcode/packet number extracted from the document
+        tests:
+          - not_null
+      - name: ACCOUNTCODE
+        description: Tradesman account code from LLM extraction or PACKET/ARCHIVEPACKET enrichment
+      - name: RECEIVEDDATE
+        description: Date the packet was received
+      - name: CREATED_AT
+        description: File creation timestamp
+      - name: MODIFIED_AT
+        description: File modification timestamp
+      - name: _FIVETRAN_FILE_PATH
+        description: Source file path from Fivetran sync
+      - name: _FIVETRAN_SYNCED
+        description: Fivetran sync timestamp

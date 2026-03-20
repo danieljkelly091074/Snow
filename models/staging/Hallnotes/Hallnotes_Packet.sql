@@ -4,48 +4,107 @@
     config(
         materialized='incremental',
         unique_key='FILE_ID',
-        schema='SHAREPOINT'
+        incremental_strategy='merge'
     )
 }}
 
-WITH source_files AS (
-    SELECT 
+with source_file as (
+    select
         h.FILE_ID,
         h.CREATED_AT,
         h.MODIFIED_AT,
         h._FIVETRAN_FILE_PATH,
         h._FIVETRAN_SYNCED
-    FROM {{ source('sharepoint', 'hallnotes') }} h
+    from {{ source('sharepoint', 'HALLNOTES') }} h
+    where h._FIVETRAN_FILE_PATH like 'root/%'
+      and exists (
+          select 1
+          from directory('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES') d
+          where d.RELATIVE_PATH = h._FIVETRAN_FILE_PATH
+      )
     {% if is_incremental() %}
-    WHERE h.FILE_ID NOT IN (SELECT FILE_ID FROM {{ this }})
+      and not exists (
+          select 1
+          from {{ this }} p
+          where p.FILE_ID = h.FILE_ID
+      )
     {% endif %}
 ),
 
-extracted AS (
-    SELECT 
+parsed as (
+    select
+        sf.*,
+        AI_PARSE_DOCUMENT(
+            TO_FILE('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES', sf._FIVETRAN_FILE_PATH),
+            {'mode': 'OCR', 'page_filter': [{'start': 0, 'end': 1}]}
+        ) as doc
+    from source_file sf
+),
+
+extracted as (
+    select
+        p.*,
+        SNOWFLAKE.CORTEX.COMPLETE(
+            'snowflake-llama-3.3-70b',
+            CONCAT(
+                'Extract the following fields from this document text. Return ONLY a valid JSON object with these exact keys: barcode_value, account_code, received_date. If a field is not found, use null.\n\n',
+                'Rules:\n',
+                '- barcode_value: IMPORTANT - Look for a code matching these patterns: (1) Letter + 5 digits like N20528, X21295, A12345 (2) 6 digits + letter like 405599B, 123456A (3) Pure 6-7 digit numbers. Usually appears prominently near the top, often near a date or weight. The code is 5-10 characters.\n',
+                '- account_code: number after "Account No." or "Acc No." or "Acc No:"\n',
+                '- received_date: Look for a date in DD-Mon-YYYY format (e.g., 04-Mar-2026, 05-Mar-2026) near the top of the document OR after "Received:". Return in DD-Mon-YYYY format.\n\n',
+                'Document text:\n',
+                doc:pages[0]:content::VARCHAR
+            )
+        ) as llm_response
+    from parsed p
+),
+
+cleaned as (
+    select
+        e.*,
+        TRY_PARSE_JSON(REGEXP_SUBSTR(llm_response, '\\{[^{}]*\\}')) as result
+    from extracted e
+),
+
+filtered as (
+    select
+        result:barcode_value::VARCHAR as PACKETNUMBER,
+        NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null') as ACCOUNTCODE,
+        TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY') as RECEIVEDDATE,
         FILE_ID,
         CREATED_AT,
         MODIFIED_AT,
         _FIVETRAN_FILE_PATH,
-        _FIVETRAN_SYNCED,
-        AI_EXTRACT(
-            TO_FILE('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES', _FIVETRAN_FILE_PATH),
-            PARSE_JSON('{"barcode_value": "What is the code shown as a barcode or find an alphanumeric code typically next to the barcode near a date at the top and does not have a letter except at the start or end of the text and is six to seven characters long?"}')
-        ) AS result
-    FROM source_files
+        _FIVETRAN_SYNCED
+    from cleaned
+    where result:barcode_value::VARCHAR is not null
+      and result:barcode_value::VARCHAR != 'null'
+      and LENGTH(result:barcode_value::VARCHAR) between 5 and 10
+),
+
+enriched as (
+    select
+        f.PACKETNUMBER,
+        COALESCE(f.ACCOUNTCODE, pk.ACCOUNTCODE, apk.ACCOUNTCODE) as ACCOUNTCODE,
+        f.RECEIVEDDATE,
+        f.FILE_ID,
+        f.CREATED_AT,
+        f.MODIFIED_AT,
+        f._FIVETRAN_FILE_PATH,
+        f._FIVETRAN_SYNCED
+    from filtered f
+    left join (
+        select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE
+        from {{ source('forge', 'PACKET') }}
+    ) pk
+        on pk.PACKETNUMBER = f.PACKETNUMBER
+        and pk.COUNTERDATE = f.RECEIVEDDATE
+    left join (
+        select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE
+        from {{ source('forge', 'ARCHIVEPACKET') }}
+    ) apk
+        on apk.PACKETNUMBER = f.PACKETNUMBER
+        and apk.COUNTERDATE = f.RECEIVEDDATE
 )
 
-SELECT 
-    GET(GET(result, 'response'), 'barcode_value')::VARCHAR AS PACKETNUMBER,
-    FILE_ID,
-    CREATED_AT,
-    MODIFIED_AT,
-    _FIVETRAN_FILE_PATH,
-    _FIVETRAN_SYNCED
-FROM extracted
-WHERE GET(GET(result, 'response'), 'barcode_value')::VARCHAR != 'None'
-{% if is_incremental() %}
-  AND GET(GET(result, 'response'), 'barcode_value')::VARCHAR NOT IN (
-      SELECT PACKETNUMBER FROM {{ this }}
-  )
-{% endif %}
+select * from enriched

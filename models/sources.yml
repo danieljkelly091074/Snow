@@ -29,5 +29,16 @@ sources:
     database: RAW__SHAREPOINT
     schema: SHAREPOINT
     tables:
-      - name: hallnotes
+      - name: HALLNOTES
+        description: Raw PDF documents synced from SharePoint via Fivetran
+      - name: HALLNOTES_PACKETNUMBER
+        description: Parsed packet data extracted from hallnotes PDFs
   
+  - name: forge
+    database: RAW__FORGE__AOPC
+    schema: DBO
+    tables:
+      - name: PACKET
+        description: Active packet records with tradesman account codes
+      - name: ARCHIVEPACKET
+        description: Archived packet records with tradesman account codes
