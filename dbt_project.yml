@@ -36,10 +36,10 @@ clean-targets:         # directories to be removed by `dbt clean`
 # using the `{{ config(...) }}` macro.
 
 models:
-  UserActions:
+  #UserActions:
     # Applies to all files under models/example/
-    staging:
-      +materialized: table
+  #  +staging:
+  #  +materialized: table
   hallnotes:
     +database: RAW__SHAREPOINT
     +schema: SHAREPOINT
