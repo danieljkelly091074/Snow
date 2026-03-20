@@ -40,8 +40,8 @@ models:
     # Applies to all files under models/example/
   #  +staging:
   #  +materialized: table
-  hallnotes:
-    +database: RAW__SHAREPOINT
-    +schema: SHAREPOINT
-    +materialized: incremental
+  #hallnotes:
+  #  +database: RAW__SHAREPOINT
+  #  +schema: SHAREPOINT
+  #  +materialized: incremental
   
