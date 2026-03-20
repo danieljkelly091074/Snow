@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 
 WITH SpeedService As (
 SELECT PacketTypeID As SpeedOfServiceKey, CASE WHEN PacketType LIKE 'Counter' THEN 'Standard' WHEN PacketType LIKE 'Early Hall' THEN 'Next Day' WHEN PacketType LIKE 'Post Early Hall' THEN 'Post Next Day' ELSE PacketType END AS SpeedDescription 

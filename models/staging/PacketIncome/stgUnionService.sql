@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 WITH UnionService As (
 SELECT ServiceKey, dbo.Packet.PacketNumber, dbo.Packet.PacketID, dbo.PacketAdditionalService.InvoiceQuantity AS Quantity, dbo.PacketAdditionalService.ServicePricePerItem AS Price, 
 FROM {{ ref('stgServiceDim') }}  INNER JOIN {{ source('DBT_SNOWFLAKE', 'PACKETADDITIONALSERVICE') }} ON EXTERNALID = ADDITIONALSERVICEID INNER JOIN {{ source('DBT_SNOWFLAKE', 'PACKET') }}  ON DBO.PACKET.PACKETNUMBER = DBO.PACKETADDITIONALSERVICE.PACKETNUMBER 

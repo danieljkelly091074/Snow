@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 
 WITH DateIncome As (
 SELECT DISTINCT TO_CHAR(dbo.Packet.Opened, 'YYYYMMDD')::INT AS DATEKEY, TO_DATE(TO_VARCHAR(dbo.Packet.Opened, 'DD/MM/YYYY'),'DD/MM/YYYY') As OpenedDate, DATE_PART(Day, dbo.Packet.Opened) AS Day, DATE_PART(Month, dbo.Packet.Opened) AS Month, DATE_PART(Year, dbo.Packet.Opened) AS Year, DATE_PART(Quarter, dbo.Packet.Opened) AS Quarter, MonthName(TO_DATE(dbo.Packet.Opened)) AS MonthName, DAYNAME(TO_DATE(dbo.Packet.Opened)) AS DayName

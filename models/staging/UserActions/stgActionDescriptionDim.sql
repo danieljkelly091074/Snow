@@ -1,4 +1,4 @@
-{{ config(materilized='table')}}
+{{ config(materialized='table')}}
 
 WITH ActionDescription AS (
 SELECT * FROM {{ source('DBT_SNOWFLAKE', 'ACTIONDIM') }} 

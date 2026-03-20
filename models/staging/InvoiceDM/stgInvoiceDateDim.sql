@@ -1,4 +1,4 @@
---{{ config(materilized='table')}}
+--{{ config(materialized='table')}}
 
 --WITH DateDim AS (
 --SELECT DISTINCT TO_CHAR(COUNTER, 'YYYYMMDD')::INT AS DATEKEY, TO_DATE(TO_VARCHAR(COUNTER, 'DD/MM/YYYY'),'DD/MM/YYYY') As Date, DATE_PART(Day, COUNTER) AS Day, DATE_PART(Month, COUNTER) AS Month, DATE_PART(Year, COUNTER) AS Year, DATE_PART(Quarter, COUNTER) AS Quarter, MonthName(TO_DATE(COUNTER)) AS MonthName, DAYNAME(TO_DATE(COUNTER)) AS DayName
