@@ -23,6 +23,10 @@ sources:
       - name: ARCHIVEPACKETITEM
       - name: PAYMENTS
       - name: ARCHIVEPAYMENTS
+      - name: ITEM
+      - name: INVOICELINETITLE
+      - name: ADDITIONALSERVICE
+
 
 
   - name: sharepoint
