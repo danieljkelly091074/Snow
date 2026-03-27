@@ -10,7 +10,7 @@ WITH InvoiceFact AS (
         cd.AccountCode AS AccountKey,
         hd.HEADERID AS HeaderKey,
         pi.InvoiceQuantity AS Quantity,
-        pi.InvoiceQuantity * pi.ItemPricePerItem AS Price,
+        pi.ItemPricePerItem AS Price,
         p.VATRate AS VAT
     FROM {{ source('DBT_SNOWFLAKE', 'PACKET') }} p
     INNER JOIN {{ source('DBT_SNOWFLAKE', 'PACKETITEM') }} pi
@@ -33,7 +33,7 @@ WITH InvoiceFact AS (
         cd.AccountCode AS AccountKey,
         hd.HEADERID AS HeaderKey,
         api.InvoiceQuantity AS Quantity,
-        api.InvoiceQuantity * api.ItemPricePerItem AS Price,
+        api.ItemPricePerItem AS Price,
         ap.VATRate AS VAT
     FROM {{ source('DBT_SNOWFLAKE', 'ARCHIVEPACKET') }} ap
     INNER JOIN {{ source('DBT_SNOWFLAKE', 'ARCHIVEPACKETITEM') }} api
@@ -56,7 +56,7 @@ WITH InvoiceFact AS (
         cd.AccountCode AS AccountKey,
         hd.HEADERID AS HeaderKey,
         pas.InvoiceQuantity AS Quantity,
-        pas.InvoiceQuantity * pas.ServicePricePerItem AS Price,
+        pas.ServicePricePerItem AS Price,
         p.VATRate AS VAT
     FROM {{ source('DBT_SNOWFLAKE', 'PACKETADDITIONALSERVICE') }} pas
     INNER JOIN {{ source('DBT_SNOWFLAKE', 'PACKET') }} p
@@ -81,7 +81,7 @@ WITH InvoiceFact AS (
         cd.AccountCode AS AccountKey,
         hd.HEADERID AS HeaderKey,
         apas.InvoiceQuantity AS Quantity,
-        apas.InvoiceQuantity * apas.ServicePricePerItem AS Price,
+        apas.ServicePricePerItem AS Price,
         ap.VATRate AS VAT
     FROM {{ source('DBT_SNOWFLAKE', 'ARCHIVEPACKETADDITIONALSERVICE') }} apas
     INNER JOIN {{ source('DBT_SNOWFLAKE', 'ARCHIVEPACKET') }} ap
