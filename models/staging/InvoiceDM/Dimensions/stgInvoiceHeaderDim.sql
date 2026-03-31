@@ -5,19 +5,19 @@
 
 WITH HeaderDim AS (
 
-SELECT Packet.PacketID AS HeaderID, InvoiceNumber, concat('Your Ref:', ClientPacketNumber) AS ClientRef, SUM(Amount) AS PaymentAmount, Packet.PacketNumber, PacketType, CustomerVAT, ZeroVatMessage, current_date() AS created_at
+SELECT Packet.PacketID AS HeaderID, InvoiceNumber, concat('Your Ref:', ClientPacketNumber) AS ClientRef, SUM(Amount) AS PaymentAmount, Packet.PacketNumber, PacketType, CustomerVAT, ZeroVatMessage, Packet.COUNTER, current_date() AS created_at
 FROM {{ source('DBT_SNOWFLAKE', 'CUSTOMER') }} INNER JOIN {{ source('DBT_SNOWFLAKE', 'PACKET') }} ON Customer.AccountCode = Packet.TradesmanAccountCode
 LEFT OUTER JOIN {{ source('DBT_SNOWFLAKE', 'PAYMENTS') }} ON Packet.PacketNumber = Payments.PacketNumber
 GROUP BY Packet.PacketNumber, LeftHall, InvoiceNumber, Packet.PacketID, Packed, ClientPacketNumber, WithdrawalDateTime, PacketType,
-                         CustomerVAT, ZeroVatMessage, SentToSage
-HAVING        (SentToSage IS NOT NULL) AND (WithdrawalDateTime IS NULL) AND (InvoiceNumber IS NOT NULL)
+                         CustomerVAT, ZeroVatMessage, SentToSage, Packet.COUNTER
+HAVING        (SentToSage IS NOT NULL) AND (WithdrawalDateTime IS NULL) AND (InvoiceNumber IS NOT NULL) AND (DATEDIFF(day, COUNTER, CURRENT_DATE()) <= 2190)
 UNION ALL
-SELECT ArchivePacket.PacketID AS HeaderID, InvoiceNumber, concat('Your Ref:', ClientPacketNumber) AS ClientRef, SUM(Amount) AS PaymentAmount, ArchivePacket.PacketNumber, PacketType, CustomerVAT, ZeroVatMessage, current_date() AS created_at
+SELECT ArchivePacket.PacketID AS HeaderID, InvoiceNumber, concat('Your Ref:', ClientPacketNumber) AS ClientRef, SUM(Amount) AS PaymentAmount, ArchivePacket.PacketNumber, PacketType, CustomerVAT, ZeroVatMessage, ArchivePacket.COUNTER, current_date() AS created_at
 FROM {{ source('DBT_SNOWFLAKE', 'CUSTOMER') }} INNER JOIN {{ source('DBT_SNOWFLAKE', 'ARCHIVEPACKET') }} ON Customer.AccountCode = ArchivePacket.TradesmanAccountCode
 LEFT OUTER JOIN {{ source('DBT_SNOWFLAKE', 'ARCHIVEPAYMENTS') }} ON ArchivePacket.PacketID = ArchivePayments.PacketID
 GROUP BY ArchivePacket.PacketNumber, LeftHall, InvoiceNumber, ArchivePacket.PacketID, Packed, ClientPacketNumber, WithdrawalDateTime, PacketType,
-                         CustomerVAT, ZeroVatMessage, SentToSage
-HAVING        (SentToSage IS NOT NULL) AND (WithdrawalDateTime IS NULL) AND (InvoiceNumber IS NOT NULL)
+                         CustomerVAT, ZeroVatMessage, SentToSage, ArchivePacket.COUNTER
+HAVING        (SentToSage IS NOT NULL) AND (WithdrawalDateTime IS NULL) AND (InvoiceNumber IS NOT NULL) AND (DATEDIFF(day, ArchivePacket.COUNTER, CURRENT_DATE()) <= 2190)
 )
 
 SELECT * FROM HeaderDim
