@@ -49,7 +49,7 @@ extracted as (
             CONCAT(
                 'Extract the following fields from this document text. Return ONLY a valid JSON object with these exact keys: barcode_value, account_code, received_date. If a field is not found, use null.\n\n',
                 'Rules:\n',
-                '- barcode_value: IMPORTANT - Look for a code matching these patterns: (1) Letter + 5 digits like N20528, X21295, A12345 (2) 6 digits + letter like 405599B, 123456A (3) Pure 6-7 digit numbers. Usually appears prominently near the top, often near a date or weight. The code is 5-10 characters.\n',
+                '- barcode_value: IMPORTANT - Look for a code matching these patterns: (1) Letter + 5 digits like N20528, X21295, A12345 (2) 6 digits + letter like 405599B, 123456A (3) Pure 6-7 digit numbers. Usually appears prominently near the top, often near a date or weight. The code is 5-10 characters. Look for the large number printed prominently at the top of the hallnote (this is the packet number, e.g. 407745). Do NOT use the "Reg No" value.\n',
                 '- account_code: number after "Account No." or "Acc No." or "Acc No:"\n',
                 '- received_date: Look for a date in DD-Mon-YYYY format (e.g., 04-Mar-2026, 05-Mar-2026) near the top of the document OR after "Received:". Return in DD-Mon-YYYY format.\n\n',
                 'Document text:\n',
@@ -107,4 +107,10 @@ enriched as (
         and apk.COUNTERDATE = f.RECEIVEDDATE
 )
 
-select * from enriched
+select * from enriched e
+where not exists (
+    select 1
+    from {{ source('sharepoint','HALLNOTES_PACKETNUMBER') }} hp
+    where hp.PACKETNUMBER = e.PACKETNUMBER
+      and hp.RECEIVEDDATE = e.RECEIVEDDATE
+)
