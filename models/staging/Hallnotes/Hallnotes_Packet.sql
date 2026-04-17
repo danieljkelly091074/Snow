@@ -107,4 +107,10 @@ enriched as (
         and apk.COUNTERDATE = f.RECEIVEDDATE
 )
 
-select * from enriched 
+select * from enriched e
+where not exists (
+    select 1
+    from {{ source('sharepoint','HALLNOTES_PACKETNUMBER') }} hp
+    where hp.PACKETNUMBER = e.PACKETNUMBER
+      and hp.RECEIVEDDATE = e.RECEIVEDDATE
+)
