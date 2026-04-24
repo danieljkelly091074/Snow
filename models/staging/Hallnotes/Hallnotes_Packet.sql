@@ -51,7 +51,7 @@ extracted as (
                 'Rules:\n',
                 '- barcode_value: IMPORTANT - Look for a code matching these patterns: (1) Letter + 5 digits like N20528, X21295, A12345 (2) 6 digits + letter like 405599B, 123456A (3) Pure 6-7 digit numbers. Usually appears prominently near the top, often near a date or weight. The code is 5-10 characters. Look for the large number printed prominently at the top of the hallnote (this is the packet number, e.g. 407745). Do NOT use the "Reg No" value.\n',
                 '- account_code: Look for a PRINTED/TYPED number specifically after "Account No." or "Acc No." or "Acc No:". IGNORE any handwritten account codes - only use machine-printed text. IGNORE any values after "Your Ref" or "Your Ref:" - these are NOT account codes. The account code should be a clean numeric string (e.g., 082536, 072889) with no decimal points, letters, or slashes. If the value contains letters or slashes (like EA01740/26) it is a "Your Ref" not an account code - return null. If it appears handwritten (e.g., decimal points like 282.536), return null.\n',
-                '- received_date: Look for a date in DD-Mon-YYYY format (e.g., 04-Mar-2026, 05-Mar-2026) near the top of the document OR after "Received:". Return in DD-Mon-YYYY format.\n\n',
+                '- received_date: Look for a date near the top of the document. It may appear as DD-Mon-YYYY (e.g., 10-Mar-2026) or with a day prefix like "Wed 08-Apr-2026". Also look after "Received:". Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
                 'Document text:\n',
                 doc:pages[0]:content::VARCHAR
             )
