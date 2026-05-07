@@ -3,7 +3,7 @@
 {{
     config(
         materialized='incremental',
-        unique_key='FILE_ID',
+        unique_key=['PACKETNUMBER', 'RECEIVEDDATE', 'FILE_ID'],
         incremental_strategy='merge'
     )
 }}
@@ -85,7 +85,7 @@ filtered as (
 enriched as (
     select
         f.PACKETNUMBER,
-        COALESCE(f.ACCOUNTCODE, pk.ACCOUNTCODE, apk.ACCOUNTCODE) as ACCOUNTCODE,
+        COALESCE(pk.ACCOUNTCODE, apk.ACCOUNTCODE, f.ACCOUNTCODE) as ACCOUNTCODE,
         f.RECEIVEDDATE,
         f.FILE_ID,
         f.CREATED_AT,
