@@ -49,7 +49,7 @@ pages as (
         p._FIVETRAN_FILE_PATH,
         p._FIVETRAN_SYNCED,
         page.value:content::VARCHAR as page_content,
-        page.value:index::INT as page_index
+        page.value:pageNumber::INT as page_index
     from parsed p,
     lateral flatten(input => p.doc:pages) page
 ),
@@ -83,43 +83,86 @@ cleaned as (
 
 filtered as (
     select
-        result:barcode_value::VARCHAR as PACKETNUMBER,
+        UPPER(result:barcode_value::VARCHAR) as PACKETNUMBER,
         NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null') as ACCOUNTCODE,
-        TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY') as RECEIVEDDATE,
+        COALESCE(
+            TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY'),
+            TRY_TO_DATE(result:received_date::VARCHAR, 'YYYY-MM-DD'),
+            TRY_TO_DATE(result:received_date::VARCHAR, 'DD/MM/YYYY'),
+            TRY_TO_DATE(result:received_date::VARCHAR, 'DD-MM-YYYY')
+        ) as RECEIVEDDATE,
         FILE_ID,
         CREATED_AT,
         MODIFIED_AT,
         _FIVETRAN_FILE_PATH,
-        _FIVETRAN_SYNCED
+        _FIVETRAN_SYNCED,
+        page_index
     from cleaned
     where result:barcode_value::VARCHAR is not null
       and result:barcode_value::VARCHAR != 'null'
       and LENGTH(result:barcode_value::VARCHAR) between 5 and 10
 ),
 
+deduplicated as (
+    select
+        PACKETNUMBER,
+        ACCOUNTCODE,
+        RECEIVEDDATE,
+        FILE_ID,
+        CREATED_AT,
+        MODIFIED_AT,
+        _FIVETRAN_FILE_PATH,
+        _FIVETRAN_SYNCED,
+        ROW_NUMBER() over (
+            partition by PACKETNUMBER, FILE_ID
+            order by
+                case when RECEIVEDDATE is not null and ACCOUNTCODE is not null then 0
+                     when RECEIVEDDATE is not null then 1
+                     when ACCOUNTCODE is not null then 2
+                     else 3
+                end,
+                page_index
+        ) as rn
+    from filtered
+),
+
+best_extraction as (
+    select
+        PACKETNUMBER,
+        ACCOUNTCODE,
+        RECEIVEDDATE,
+        FILE_ID,
+        CREATED_AT,
+        MODIFIED_AT,
+        _FIVETRAN_FILE_PATH,
+        _FIVETRAN_SYNCED
+    from deduplicated
+    where rn = 1
+),
+
 enriched as (
     select
         f.PACKETNUMBER,
         COALESCE(pk.ACCOUNTCODE, apk.ACCOUNTCODE, f.ACCOUNTCODE) as ACCOUNTCODE,
-        f.RECEIVEDDATE,
+        COALESCE(f.RECEIVEDDATE, pk.COUNTERDATE, apk.COUNTERDATE) as RECEIVEDDATE,
         f.FILE_ID,
         f.CREATED_AT,
         f.MODIFIED_AT,
         f._FIVETRAN_FILE_PATH,
         f._FIVETRAN_SYNCED
-    from filtered f
+    from best_extraction f
     left join (
         select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE
         from {{ source('forge', 'PACKET') }}
     ) pk
         on pk.PACKETNUMBER = f.PACKETNUMBER
-        and pk.COUNTERDATE = f.RECEIVEDDATE
+        and (pk.COUNTERDATE = f.RECEIVEDDATE or f.RECEIVEDDATE is null)
     left join (
         select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE
         from {{ source('forge', 'ARCHIVEPACKET') }}
     ) apk
         on apk.PACKETNUMBER = f.PACKETNUMBER
-        and apk.COUNTERDATE = f.RECEIVEDDATE
+        and (apk.COUNTERDATE = f.RECEIVEDDATE or f.RECEIVEDDATE is null)
 )
 
 select * from enriched e
