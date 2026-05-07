@@ -36,14 +36,27 @@ parsed as (
         sf.*,
         AI_PARSE_DOCUMENT(
             TO_FILE('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES', sf._FIVETRAN_FILE_PATH),
-            {'mode': 'OCR', 'page_filter': [{'start': 0, 'end': 1}]}
+            {'mode': 'OCR', 'page_split': true}
         ) as doc
     from source_file sf
 ),
 
+pages as (
+    select
+        p.FILE_ID,
+        p.CREATED_AT,
+        p.MODIFIED_AT,
+        p._FIVETRAN_FILE_PATH,
+        p._FIVETRAN_SYNCED,
+        page.value:content::VARCHAR as page_content,
+        page.value:index::INT as page_index
+    from parsed p,
+    lateral flatten(input => p.doc:pages) page
+),
+
 extracted as (
     select
-        p.*,
+        pg.*,
         SNOWFLAKE.CORTEX.COMPLETE(
             'snowflake-llama-3.3-70b',
             CONCAT(
@@ -53,10 +66,12 @@ extracted as (
                 '- account_code: Look for a PRINTED/TYPED number specifically after "Account No." or "Acc No." or "Acc No:". IGNORE any handwritten account codes - only use machine-printed text. IGNORE any values after "Your Ref" or "Your Ref:" - these are NOT account codes. The account code should be a clean numeric string (e.g., 082536, 072889) with no decimal points, letters, or slashes. If the value contains letters or slashes (like EA01740/26) it is a "Your Ref" not an account code - return null. If it appears handwritten (e.g., decimal points like 282.536), return null.\n',
                 '- received_date: Look for a date near the top of the document. It may appear as DD-Mon-YYYY (e.g., 10-Mar-2026) or with a day prefix like "Wed 08-Apr-2026". Also look after "Received:". Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
                 'Document text:\n',
-                doc:pages[0]:content::VARCHAR
+                pg.page_content
             )
         ) as llm_response
-    from parsed p
+    from pages pg
+    where pg.page_content is not null
+      and LENGTH(pg.page_content) > 50
 ),
 
 cleaned as (
