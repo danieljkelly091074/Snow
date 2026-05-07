@@ -49,7 +49,8 @@ pages as (
         p._FIVETRAN_FILE_PATH,
         p._FIVETRAN_SYNCED,
         page.value:content::VARCHAR as page_content,
-        page.value:pageNumber::INT as page_index
+        page.value:index::INT as page_index,
+        ARRAY_SIZE(p.doc:pages) - 1 as max_page_index
     from parsed p,
     lateral flatten(input => p.doc:pages) page
 ),
@@ -96,7 +97,8 @@ filtered as (
         MODIFIED_AT,
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
-        page_index
+        page_index,
+        max_page_index
     from cleaned
     where result:barcode_value::VARCHAR is not null
       and result:barcode_value::VARCHAR != 'null'
@@ -114,10 +116,7 @@ deduplicated as (
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
         page_index as PAGE_INDEX,
-        COALESCE(
-            LEAD(page_index) OVER (PARTITION BY FILE_ID ORDER BY page_index) - 1,
-            page_index
-        ) as PAGE_END,
+        max_page_index,
         ROW_NUMBER() over (
             partition by PACKETNUMBER, FILE_ID
             order by
@@ -142,7 +141,10 @@ best_extraction as (
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
         PAGE_INDEX,
-        PAGE_END
+        COALESCE(
+            LEAD(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) - 1,
+            max_page_index
+        ) as PAGE_END
     from deduplicated
     where rn = 1
 ),
