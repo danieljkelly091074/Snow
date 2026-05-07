@@ -113,6 +113,11 @@ deduplicated as (
         MODIFIED_AT,
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
+        page_index as PAGE_INDEX,
+        COALESCE(
+            LEAD(page_index) OVER (PARTITION BY FILE_ID ORDER BY page_index) - 1,
+            page_index
+        ) as PAGE_END,
         ROW_NUMBER() over (
             partition by PACKETNUMBER, FILE_ID
             order by
@@ -135,7 +140,9 @@ best_extraction as (
         CREATED_AT,
         MODIFIED_AT,
         _FIVETRAN_FILE_PATH,
-        _FIVETRAN_SYNCED
+        _FIVETRAN_SYNCED,
+        PAGE_INDEX,
+        PAGE_END
     from deduplicated
     where rn = 1
 ),
@@ -149,7 +156,9 @@ enriched as (
         f.CREATED_AT,
         f.MODIFIED_AT,
         f._FIVETRAN_FILE_PATH,
-        f._FIVETRAN_SYNCED
+        f._FIVETRAN_SYNCED,
+        f.PAGE_INDEX,
+        f.PAGE_END
     from best_extraction f
     left join (
         select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE
