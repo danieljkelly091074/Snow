@@ -82,9 +82,9 @@ cleaned as (
     from extracted e
 ),
 
-filtered as (
+all_detections as (
     select
-        UPPER(result:barcode_value::VARCHAR) as PACKETNUMBER,
+        UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')) as PACKETNUMBER,
         NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null') as ACCOUNTCODE,
         COALESCE(
             TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY'),
@@ -98,14 +98,28 @@ filtered as (
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
         page_index,
-        max_page_index
+        max_page_index,
+        case
+            when REGEXP_LIKE(UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')), '^[A-Za-z]?[0-9]+[A-Za-z]?$')
+                 and UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')) != COALESCE(NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null'), '')
+            then true
+            else false
+        end as is_valid
     from cleaned
     where result:barcode_value::VARCHAR is not null
       and result:barcode_value::VARCHAR != 'null'
-      and LENGTH(result:barcode_value::VARCHAR) between 5 and 10
+      and LENGTH(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')) between 5 and 10
 ),
 
-deduplicated as (
+valid_detections as (
+    select * from all_detections where is_valid
+),
+
+invalid_detections as (
+    select * from all_detections where not is_valid
+),
+
+valid_deduplicated as (
     select
         PACKETNUMBER,
         ACCOUNTCODE,
@@ -115,7 +129,7 @@ deduplicated as (
         MODIFIED_AT,
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
-        page_index as PAGE_INDEX,
+        MIN(page_index) as PAGE_INDEX,
         max_page_index,
         ROW_NUMBER() over (
             partition by PACKETNUMBER, FILE_ID
@@ -127,10 +141,11 @@ deduplicated as (
                 end,
                 page_index
         ) as rn
-    from filtered
+    from valid_detections
+    group by PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, page_index, max_page_index
 ),
 
-best_extraction as (
+best_valid as (
     select
         PACKETNUMBER,
         ACCOUNTCODE,
@@ -141,12 +156,48 @@ best_extraction as (
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
         PAGE_INDEX,
+        max_page_index,
         COALESCE(
             LEAD(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) - 1,
             max_page_index
-        ) as PAGE_END
-    from deduplicated
+        ) as PAGE_END,
+        LAG(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) as prev_valid_start
+    from valid_deduplicated
     where rn = 1
+),
+
+page_adjusted as (
+    select
+        bv.PACKETNUMBER,
+        bv.ACCOUNTCODE,
+        bv.RECEIVEDDATE,
+        bv.FILE_ID,
+        bv.CREATED_AT,
+        bv.MODIFIED_AT,
+        bv._FIVETRAN_FILE_PATH,
+        bv._FIVETRAN_SYNCED,
+        COALESCE(
+            (select MIN(inv.page_index)
+             from invalid_detections inv
+             where inv.FILE_ID = bv.FILE_ID
+               and inv.page_index < bv.PAGE_INDEX
+               and inv.page_index > COALESCE(bv.prev_valid_start, -1)
+               and (inv.ACCOUNTCODE = bv.ACCOUNTCODE or inv.PACKETNUMBER = bv.ACCOUNTCODE)
+            ),
+            bv.PAGE_INDEX
+        ) as PAGE_INDEX,
+        bv.max_page_index
+    from best_valid bv
+),
+
+final_pages as (
+    select
+        pa.*,
+        COALESCE(
+            LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
+            pa.max_page_index
+        ) as PAGE_END
+    from page_adjusted pa
 ),
 
 enriched as (
@@ -161,7 +212,7 @@ enriched as (
         f._FIVETRAN_SYNCED,
         f.PAGE_INDEX,
         f.PAGE_END
-    from best_extraction f
+    from final_pages f
     left join (
         select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE
         from {{ source('forge', 'PACKET') }}
@@ -183,3 +234,4 @@ where not exists (
     where hp.PACKETNUMBER = e.PACKETNUMBER
       and hp.RECEIVEDDATE = e.RECEIVEDDATE
 )
+
