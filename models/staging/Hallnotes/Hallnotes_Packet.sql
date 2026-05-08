@@ -100,7 +100,7 @@ all_detections as (
         page_index,
         max_page_index,
         case
-            when REGEXP_LIKE(UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')), '^[A-Za-z]?[0-9]+[A-Za-z]?$')
+            when REGEXP_LIKE(UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')), '^[A-Za-z]?[0-9]+[A-Za-z]{0,2}$')
                  and UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')) != COALESCE(NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null'), '')
             then true
             else false
