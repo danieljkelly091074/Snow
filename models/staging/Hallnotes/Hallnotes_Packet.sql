@@ -63,7 +63,7 @@ extracted as (
             CONCAT(
                 'Extract the following fields from this document text. Return ONLY a valid JSON object with these exact keys: barcode_value, account_code, received_date. If a field is not found, use null.\n\n',
                 'Rules:\n',
-                '- barcode_value: Look for the MAIN packet/barcode number printed prominently, usually near the top of the page. It matches these patterns: (1) Letter(s) + digits + optional letter suffix like S16582A, N20528, Q53047A (2) Digits + letter suffix like 405599B, 412931C (3) Pure 5-7 digit numbers like 412905. The code is 5-10 characters total. IMPORTANT: Preserve the FULL value exactly as printed including ALL leading letters. Do NOT drop or truncate any characters. Do NOT use the "Reg No" value.\n',
+                '- barcode_value: Look for the MAIN packet/barcode number printed prominently, usually near the top of the page. It matches these patterns: (1) Letter(s) + digits + optional letter suffix like S16582A, N20528, Q53047A (2) Digits + letter suffix like 405599B, 412931C, 412834C (3) Pure 5-7 digit numbers like 412905. The code is 5-10 characters total. IMPORTANT: Preserve the FULL value exactly as printed including ALL leading letters. Do NOT drop or truncate any characters. Do NOT use the "Reg No" value. Do NOT include hallmark quality marks like "A+B", "A+C", "B+", etc. - if you see "A+B 412834C", the packet number is just "412834C".\n',
                 '- account_code: Look for a PRINTED/TYPED number specifically after "Account No." or "Acc No." or "Acc No:". Read ALL digits carefully - account codes can be 4 to 6 digits (e.g. 074014, 082536, 51414). Do NOT truncate - read every digit. IGNORE any handwritten account codes. IGNORE any values after "Your Ref" or "Your Ref:" - these are NOT account codes. If the value contains letters or slashes it is NOT an account code - return null. If it appears handwritten return null.\n',
                 '- received_date: Look for a date near the top of the document. It may appear as DD-Mon-YYYY (e.g., 07-May-2026) or with a day prefix like "Wed 07-May-2026". Also look after "Received:". IMPORTANT: Read the day number carefully - distinguish between similar digits like 7 and 8, 1 and 7. Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
                 'Document text:\n',
@@ -82,9 +82,17 @@ cleaned as (
     from extracted e
 ),
 
-all_detections as (
+all_detections_raw as (
     select
-        UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')) as PACKETNUMBER,
+        UPPER(COALESCE(
+            CASE
+                WHEN CONTAINS(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''), '+')
+                THEN REGEXP_SUBSTR(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''), '[0-9]{5,}[A-Za-z]{0,2}')
+                ELSE NULL
+            END,
+            REGEXP_SUBSTR(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''), '^[A-Za-z]?[0-9]{5,}[A-Za-z]{0,2}$'),
+            REGEXP_SUBSTR(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''), '[0-9]{5,}[A-Za-z]{0,2}')
+        )) as PACKETNUMBER,
         NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null') as ACCOUNTCODE,
         COALESCE(
             TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY'),
@@ -98,30 +106,49 @@ all_detections as (
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
         page_index,
-        max_page_index,
-        case
-            when REGEXP_LIKE(
-                     UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')),
-                     '^[A-Za-z]?[0-9]+[A-Za-z]{0,2}$'
-                 )
-                 and LENGTH(UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''))) between 5 and 10
-                 and NOT REGEXP_LIKE(
-                     UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')),
-                     '^[0-9]{8,}$'
-                 )
-                 and UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''))
-                     != COALESCE(NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null'), '')
-            then true
-            else false
-        end as is_valid
+        max_page_index
     from cleaned
     where result:barcode_value::VARCHAR is not null
       and result:barcode_value::VARCHAR != 'null'
-      and LENGTH(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')) between 5 and 10
+),
+
+all_detections as (
+    select
+        *,
+        case
+            when PACKETNUMBER is not null
+                 and REGEXP_LIKE(PACKETNUMBER, '^[A-Za-z]?[0-9]+[A-Za-z]{0,2}$')
+                 and LENGTH(PACKETNUMBER) between 5 and 10
+                 and NOT REGEXP_LIKE(PACKETNUMBER, '^[0-9]{8,}$')
+                 and PACKETNUMBER != COALESCE(ACCOUNTCODE, '')
+            then true
+            else false
+        end as is_valid
+    from all_detections_raw
+    where PACKETNUMBER is not null
+      and LENGTH(PACKETNUMBER) between 5 and 10
+),
+
+valid_detections_raw as (
+    select * from all_detections where is_valid
 ),
 
 valid_detections as (
-    select * from all_detections where is_valid
+    select
+        COALESCE(
+            CASE
+                WHEN REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]')
+                     AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
+                     AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER)
+                     AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))
+                          OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2)))
+                THEN SUBSTR(v.PACKETNUMBER, 2)
+                ELSE NULL
+            END,
+            v.PACKETNUMBER
+        ) as PACKETNUMBER,
+        v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid
+    from valid_detections_raw v
 ),
 
 invalid_detections as (
