@@ -50,7 +50,7 @@ pages as (
         p._FIVETRAN_SYNCED,
         page.value:content::VARCHAR as page_content,
         page.value:index::INT as page_index,
-        ARRAY_SIZE(p.doc:pages) - 1 as max_page_index
+        MAX(page.value:index::INT) OVER (PARTITION BY p.FILE_ID) as max_page_index
     from parsed p,
     lateral flatten(input => p.doc:pages) page
 ),
@@ -63,9 +63,9 @@ extracted as (
             CONCAT(
                 'Extract the following fields from this document text. Return ONLY a valid JSON object with these exact keys: barcode_value, account_code, received_date. If a field is not found, use null.\n\n',
                 'Rules:\n',
-                '- barcode_value: IMPORTANT - Look for a code matching these patterns: (1) Letter + 5 digits like N20528, X21295, A12345 (2) 6 digits + letter like 405599B, 123456A (3) Pure 6-7 digit numbers. Usually appears prominently near the top, often near a date or weight. The code is 5-10 characters. Look for the large number printed prominently at the top of the hallnote (this is the packet number, e.g. 407745). Do NOT use the "Reg No" value.\n',
-                '- account_code: Look for a PRINTED/TYPED number specifically after "Account No." or "Acc No." or "Acc No:". IGNORE any handwritten account codes - only use machine-printed text. IGNORE any values after "Your Ref" or "Your Ref:" - these are NOT account codes. The account code should be a clean numeric string (e.g., 082536, 072889) with no decimal points, letters, or slashes. If the value contains letters or slashes (like EA01740/26) it is a "Your Ref" not an account code - return null. If it appears handwritten (e.g., decimal points like 282.536), return null.\n',
-                '- received_date: Look for a date near the top of the document. It may appear as DD-Mon-YYYY (e.g., 10-Mar-2026) or with a day prefix like "Wed 08-Apr-2026". Also look after "Received:". Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
+                '- barcode_value: Look for the MAIN packet/barcode number printed prominently, usually near the top of the page. It matches these patterns: (1) Letter(s) + digits + optional letter suffix like S16582A, N20528, Q53047A (2) Digits + letter suffix like 405599B, 412931C (3) Pure 5-7 digit numbers like 412905. The code is 5-10 characters total. IMPORTANT: Preserve the FULL value exactly as printed including ALL leading letters. Do NOT drop or truncate any characters. Do NOT use the "Reg No" value.\n',
+                '- account_code: Look for a PRINTED/TYPED number specifically after "Account No." or "Acc No." or "Acc No:". Read ALL digits carefully - account codes can be 4 to 6 digits (e.g. 074014, 082536, 51414). Do NOT truncate - read every digit. IGNORE any handwritten account codes. IGNORE any values after "Your Ref" or "Your Ref:" - these are NOT account codes. If the value contains letters or slashes it is NOT an account code - return null. If it appears handwritten return null.\n',
+                '- received_date: Look for a date near the top of the document. It may appear as DD-Mon-YYYY (e.g., 07-May-2026) or with a day prefix like "Wed 07-May-2026". Also look after "Received:". IMPORTANT: Read the day number carefully - distinguish between similar digits like 7 and 8, 1 and 7. Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
                 'Document text:\n',
                 pg.page_content
             )
@@ -84,7 +84,7 @@ cleaned as (
 
 all_detections as (
     select
-        UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')) as PACKETNUMBER,
+        UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')) as PACKETNUMBER,
         NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null') as ACCOUNTCODE,
         COALESCE(
             TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY'),
@@ -100,15 +100,24 @@ all_detections as (
         page_index,
         max_page_index,
         case
-            when REGEXP_LIKE(UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')), '^[A-Za-z]?[0-9]+[A-Za-z]{0,2}$')
-                 and UPPER(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')) != COALESCE(NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null'), '')
+            when REGEXP_LIKE(
+                     UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')),
+                     '^[A-Za-z]?[0-9]+[A-Za-z]{0,2}$'
+                 )
+                 and LENGTH(UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''))) between 5 and 10
+                 and NOT REGEXP_LIKE(
+                     UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')),
+                     '^[0-9]{8,}$'
+                 )
+                 and UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''))
+                     != COALESCE(NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null'), '')
             then true
             else false
         end as is_valid
     from cleaned
     where result:barcode_value::VARCHAR is not null
       and result:barcode_value::VARCHAR != 'null'
-      and LENGTH(REGEXP_REPLACE(result:barcode_value::VARCHAR, '^[A-Za-z]\\s+', '')) between 5 and 10
+      and LENGTH(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')) between 5 and 10
 ),
 
 valid_detections as (
@@ -160,7 +169,7 @@ best_valid as (
         COALESCE(
             LEAD(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) - 1,
             max_page_index
-        ) as PAGE_END,
+        ) as PAGE_END_RAW,
         LAG(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) as prev_valid_start
     from valid_deduplicated
     where rn = 1
@@ -193,10 +202,14 @@ page_adjusted as (
 final_pages as (
     select
         pa.*,
-        COALESCE(
-            LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
-            pa.max_page_index
-        ) as PAGE_END
+        case
+            when LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) is null
+            then pa.max_page_index + 1
+            else LEAST(
+                LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
+                pa.PAGE_INDEX + 5
+            )
+        end as PAGE_END
     from page_adjusted pa
 ),
 
@@ -234,4 +247,3 @@ where not exists (
     where hp.PACKETNUMBER = e.PACKETNUMBER
       and hp.RECEIVEDDATE = e.RECEIVEDDATE
 )
-
