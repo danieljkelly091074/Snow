@@ -237,7 +237,7 @@ final_pages as (
         pa.*,
         case
             when LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) is null
-            then pa.max_page_index + 1
+            then pa.max_page_index
             else LEAST(
                 LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
                 pa.PAGE_INDEX + 5
@@ -260,17 +260,19 @@ enriched as (
         f.PAGE_END
     from final_pages f
     left join (
-        select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE
+        select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
+               ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER ORDER BY COUNTER DESC) as rn
         from {{ source('forge', 'PACKET') }}
     ) pk
         on pk.PACKETNUMBER = f.PACKETNUMBER
-        and (pk.COUNTERDATE = f.RECEIVEDDATE or f.RECEIVEDDATE is null)
+        and (pk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and pk.rn = 1))
     left join (
-        select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE
+        select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
+               ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER ORDER BY COUNTER DESC) as rn
         from {{ source('forge', 'ARCHIVEPACKET') }}
     ) apk
         on apk.PACKETNUMBER = f.PACKETNUMBER
-        and (apk.COUNTERDATE = f.RECEIVEDDATE or f.RECEIVEDDATE is null)
+        and (apk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and apk.rn = 1))
 )
 
 select * from enriched e
