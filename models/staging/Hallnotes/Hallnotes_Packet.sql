@@ -125,6 +125,35 @@ all_detections_raw as (
       and result:barcode_value::VARCHAR != 'null'
 ),
 
+regex_fallback as (
+    select
+        UPPER(REGEXP_SUBSTR(page_content, '\\b([A-Za-z][0-9]{4,6}[A-Za-z]?)\\b', 1, 1, 'e')) as PACKETNUMBER,
+        NULL as ACCOUNTCODE,
+        COALESCE(
+            TRY_TO_DATE(REGEXP_SUBSTR(page_content, '(\\d{2}-[A-Za-z]{3}-\\d{4})', 1, 1, 'e'), 'DD-Mon-YYYY'),
+            TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY')
+        ) as RECEIVEDDATE,
+        FILE_ID,
+        CREATED_AT,
+        MODIFIED_AT,
+        _FIVETRAN_FILE_PATH,
+        _FIVETRAN_SYNCED,
+        page_index,
+        max_page_index,
+        page_content,
+        false as is_supplementary
+    from cleaned
+    where (result:barcode_value::VARCHAR is null or result:barcode_value::VARCHAR = 'null')
+      and NOT CONTAINS(UPPER(page_content), 'ARTICLE DISCREPANCY NOTE')
+      and REGEXP_SUBSTR(page_content, '\\b([A-Za-z][0-9]{4,6}[A-Za-z]?)\\b', 1, 1, 'e') is not null
+),
+
+all_detections_combined as (
+    select * from all_detections_raw
+    union all
+    select * from regex_fallback
+),
+
 all_detections as (
     select
         *,
@@ -138,7 +167,7 @@ all_detections as (
             else false
         end as is_valid,
         CONTAINS(UPPER(page_content), 'PACKET TYPE:') as is_hallnote_header
-    from all_detections_raw
+    from all_detections_combined
     where PACKETNUMBER is not null
       and LENGTH(PACKETNUMBER) between 5 and 10
       and is_supplementary = false
