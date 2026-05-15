@@ -118,6 +118,7 @@ all_detections_raw as (
         _FIVETRAN_SYNCED,
         page_index,
         max_page_index,
+        page_content,
         CASE WHEN CONTAINS(UPPER(page_content), 'ARTICLE DISCREPANCY NOTE') THEN true ELSE false END as is_supplementary
     from cleaned
     where result:barcode_value::VARCHAR is not null
