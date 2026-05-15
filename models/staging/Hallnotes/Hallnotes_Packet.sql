@@ -174,6 +174,7 @@ valid_detections_corrected as (
     select
         CASE
             WHEN v.is_hallnote_header
+                 AND v.PACKETNUMBER != LEAD(v.PACKETNUMBER) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index)
                  AND v.ACCOUNTCODE = LEAD(v.ACCOUNTCODE) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index)
                  AND NOT COALESCE(LEAD(v.is_hallnote_header) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index), false)
             THEN LEAD(v.PACKETNUMBER) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index)
@@ -182,6 +183,7 @@ valid_detections_corrected as (
         v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid,
         CASE
             WHEN v.is_hallnote_header
+                 AND v.PACKETNUMBER != LEAD(v.PACKETNUMBER) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index)
                  AND v.ACCOUNTCODE = LEAD(v.ACCOUNTCODE) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index)
                  AND NOT COALESCE(LEAD(v.is_hallnote_header) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index), false)
             THEN true
