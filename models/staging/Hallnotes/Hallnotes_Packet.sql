@@ -63,9 +63,9 @@ extracted as (
             CONCAT(
                 'Extract the following fields from this document text. Return ONLY a valid JSON object with these exact keys: barcode_value, account_code, received_date. If a field is not found, use null.\n\n',
                 'Rules:\n',
-                '- barcode_value: Look for the MAIN packet/barcode number printed prominently, usually near the top of the page. It matches these patterns: (1) Letter(s) + digits + optional letter suffix like S16582A, S2271XB, N20528, Q53047A (2) Digits + letter suffix like 405599B, 412931C, 412834C (3) Pure 5-7 digit numbers like 412905. The code is 5-10 characters total. IMPORTANT: Preserve the FULL value exactly as printed including ALL leading letters. Do NOT drop or truncate any characters. Do NOT use the "Reg No" value. Do NOT include hallmark quality marks like "A+B", "A+C", "B+", etc. - if you see "A+B 412834C", the packet number is just "412834C". The text may have OCR noise - look carefully even if text is garbled.\n',
+                '- barcode_value: Look for the MAIN packet/barcode number printed prominently, usually near the top of the page. It matches these patterns: (1) Letter(s) + digits + optional letter suffix like S16582A, S2271XB, N20528, Q53047A (2) Digits + letter suffix like 405599B, 412931C, 412834C (3) Pure 5-7 digit numbers like 412905. The code is 5-10 characters total. IMPORTANT: Preserve the FULL value exactly as printed including ALL leading letters. Do NOT drop or truncate any characters. Do NOT use the "Reg No" value. Do NOT include hallmark quality marks like "A+B", "A+C", "B+", etc. - if you see "A+B 412834C", the packet number is just "412834C". The text may have OCR noise - look carefully even if text is garbled. IMPORTANT: If the page contains "Article Discrepancy Note" text, it is a supplementary page belonging to the PREVIOUS packet - it does NOT start a new packet. The barcode on such pages is the SAME as the preceding packet.\n',
                 '- account_code: Look for a PRINTED/TYPED number specifically after "Account No." or "Acc No." or "Acc No:". Read ALL digits carefully - account codes can be 4 to 6 digits (e.g. 074014, 082536, 51414). Do NOT truncate - read every digit. IGNORE any handwritten account codes. IGNORE any values after "Your Ref" or "Your Ref:" - these are NOT account codes. If the value contains letters or slashes it is NOT an account code - return null. If it appears handwritten return null.\n',
-                '- received_date: Look for the RECEIVED date - this is the date at the VERY TOP of the page, usually on the first line, often prefixed with a day of the week (e.g. "Thu 30-Apr-2026"). Do NOT use "Est Comp" dates or estimated completion dates - these are different. The received date is always at the very start of the document. Also check after "Received:". IMPORTANT: Read the day number carefully - distinguish between similar digits like 7 and 8, 1 and 7. Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
+                '- received_date: Look for the RECEIVED date - this is the date at the VERY TOP of the page, usually on the first line, often prefixed with a day of the week (e.g. "Thu 30-Apr-2026"). Do NOT use "Est Comp" dates or estimated completion dates - these appear BELOW the barcode/packet number and are a DIFFERENT field entirely. If the only date you can find is labelled "Est Comp" or "Estimated Completion", return null - there is NO received date. The received date is always at the very start of the document BEFORE the barcode. Also check after "Received:". IMPORTANT: Read the day number carefully - distinguish between similar digits like 7 and 8, 1 and 7. Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
                 'Document text:\n',
                 pg.page_content
             )
@@ -106,7 +106,8 @@ all_detections_raw as (
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
         page_index,
-        max_page_index
+        max_page_index,
+        CASE WHEN CONTAINS(UPPER(page_content), 'ARTICLE DISCREPANCY NOTE') THEN true ELSE false END as is_supplementary
     from cleaned
     where result:barcode_value::VARCHAR is not null
       and result:barcode_value::VARCHAR != 'null'
@@ -127,6 +128,7 @@ all_detections as (
     from all_detections_raw
     where PACKETNUMBER is not null
       and LENGTH(PACKETNUMBER) between 5 and 10
+      and is_supplementary = false
 ),
 
 valid_detections_raw as (
