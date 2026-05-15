@@ -82,6 +82,17 @@ cleaned as (
     from extracted e
 ),
 
+hallnote_boundaries as (
+    select
+        FILE_ID,
+        page_index,
+        LEAD(page_index) OVER (PARTITION BY FILE_ID ORDER BY page_index) as next_boundary
+    from cleaned
+    where CONTAINS(UPPER(page_content), 'HALLNOTE')
+      and CONTAINS(UPPER(page_content), 'PACKET TYPE:')
+      and NOT CONTAINS(UPPER(page_content), 'ARTICLE DISCREPANCY NOTE')
+),
+
 all_detections_raw as (
     select
         UPPER(COALESCE(
@@ -124,7 +135,8 @@ all_detections as (
                  and PACKETNUMBER != COALESCE(ACCOUNTCODE, '')
             then true
             else false
-        end as is_valid
+        end as is_valid,
+        CONTAINS(UPPER(page_content), 'PACKET TYPE:') as is_hallnote_header
     from all_detections_raw
     where PACKETNUMBER is not null
       and LENGTH(PACKETNUMBER) between 5 and 10
@@ -149,7 +161,7 @@ valid_detections as (
             END,
             v.PACKETNUMBER
         ) as PACKETNUMBER,
-        v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid
+        v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid, v.is_hallnote_header
     from valid_detections_raw v
     where EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
        OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER)
@@ -157,9 +169,31 @@ valid_detections as (
        OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))
 ),
 
+valid_detections_corrected as (
+    select
+        CASE
+            WHEN v.is_hallnote_header
+                 AND v.ACCOUNTCODE = LEAD(v.ACCOUNTCODE) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index)
+                 AND NOT COALESCE(LEAD(v.is_hallnote_header) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index), false)
+            THEN LEAD(v.PACKETNUMBER) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index)
+            ELSE v.PACKETNUMBER
+        END as PACKETNUMBER,
+        v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid,
+        CASE
+            WHEN v.is_hallnote_header
+                 AND v.ACCOUNTCODE = LEAD(v.ACCOUNTCODE) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index)
+                 AND NOT COALESCE(LEAD(v.is_hallnote_header) OVER (PARTITION BY v.FILE_ID ORDER BY v.page_index), false)
+            THEN true
+            ELSE false
+        END as is_corrected_header
+    from valid_detections v
+),
+
 invalid_detections as (
     select * from all_detections where not is_valid
 ),
+
+
 
 valid_deduplicated as (
     select
@@ -183,7 +217,8 @@ valid_deduplicated as (
                 end,
                 page_index
         ) as rn
-    from valid_detections
+    from valid_detections_corrected
+    where is_corrected_header = false
     group by PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, page_index, max_page_index
 ),
 
@@ -219,6 +254,12 @@ page_adjusted as (
         bv._FIVETRAN_FILE_PATH,
         bv._FIVETRAN_SYNCED,
         COALESCE(
+            (select MAX(hb.page_index)
+             from hallnote_boundaries hb
+             where hb.FILE_ID = bv.FILE_ID
+               and hb.page_index < bv.PAGE_INDEX
+               and hb.page_index > COALESCE(bv.prev_valid_start, -1)
+            ),
             (select MIN(inv.page_index)
              from invalid_detections inv
              where inv.FILE_ID = bv.FILE_ID
@@ -235,14 +276,10 @@ page_adjusted as (
 final_pages as (
     select
         pa.*,
-        case
-            when LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) is null
-            then pa.max_page_index
-            else LEAST(
-                LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
-                pa.PAGE_INDEX + 5
-            )
-        end as PAGE_END
+        COALESCE(
+            LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
+            LEAST(pa.max_page_index, pa.PAGE_INDEX + 5)
+        ) as PAGE_END
     from page_adjusted pa
 ),
 
