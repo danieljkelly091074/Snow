@@ -254,25 +254,60 @@ valid_deduplicated as (
     group by PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, page_index, max_page_index
 ),
 
-best_valid as (
+contiguous_pages as (
     select
         PACKETNUMBER,
-        ACCOUNTCODE,
-        RECEIVEDDATE,
         FILE_ID,
-        CREATED_AT,
-        MODIFIED_AT,
-        _FIVETRAN_FILE_PATH,
-        _FIVETRAN_SYNCED,
-        PAGE_INDEX,
-        max_page_index,
+        page_index,
+        page_index - ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, FILE_ID ORDER BY page_index) as grp
+    from valid_detections_corrected
+    where is_corrected_header = false
+),
+
+contiguous_groups as (
+    select
+        PACKETNUMBER,
+        FILE_ID,
+        grp,
+        MIN(page_index) as first_page,
+        MAX(page_index) as last_page,
+        ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, FILE_ID ORDER BY MIN(page_index)) as group_rn
+    from contiguous_pages
+    group by PACKETNUMBER, FILE_ID, grp
+),
+
+first_contiguous_group as (
+    select
+        PACKETNUMBER,
+        FILE_ID,
+        first_page,
+        last_page as last_page_in_group
+    from contiguous_groups
+    where group_rn = 1
+),
+
+best_valid as (
+    select
+        vd.PACKETNUMBER,
+        vd.ACCOUNTCODE,
+        vd.RECEIVEDDATE,
+        vd.FILE_ID,
+        vd.CREATED_AT,
+        vd.MODIFIED_AT,
+        vd._FIVETRAN_FILE_PATH,
+        vd._FIVETRAN_SYNCED,
+        vd.PAGE_INDEX,
+        vd.max_page_index,
         COALESCE(
-            LEAD(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) - 1,
-            max_page_index
+            LEAD(vd.PAGE_INDEX) OVER (PARTITION BY vd.FILE_ID ORDER BY vd.PAGE_INDEX) - 1,
+            vd.max_page_index
         ) as PAGE_END_RAW,
-        LAG(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) as prev_valid_start
-    from valid_deduplicated
-    where rn = 1
+        LAG(vd.PAGE_INDEX) OVER (PARTITION BY vd.FILE_ID ORDER BY vd.PAGE_INDEX) as prev_valid_start,
+        fcg.last_page_in_group
+    from valid_deduplicated vd
+    left join first_contiguous_group fcg
+        on fcg.PACKETNUMBER = vd.PACKETNUMBER and fcg.FILE_ID = vd.FILE_ID
+    where vd.rn = 1
 ),
 
 page_adjusted as (
@@ -301,16 +336,20 @@ page_adjusted as (
             ),
             bv.PAGE_INDEX
         ) as PAGE_INDEX,
-        bv.max_page_index
+        bv.max_page_index,
+        bv.last_page_in_group
     from best_valid bv
 ),
 
 final_pages as (
     select
         pa.*,
-        COALESCE(
-            LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
-            LEAST(pa.max_page_index, pa.PAGE_INDEX + 5)
+        LEAST(
+            COALESCE(
+                LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
+                LEAST(pa.max_page_index, pa.PAGE_INDEX + 5)
+            ),
+            COALESCE(pa.last_page_in_group, pa.PAGE_INDEX + 5)
         ) as PAGE_END
     from page_adjusted pa
 ),
