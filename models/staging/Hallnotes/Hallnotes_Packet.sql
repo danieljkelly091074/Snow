@@ -256,34 +256,31 @@ valid_deduplicated as (
 
 contiguous_pages as (
     select
-        PACKETNUMBER,
-        FILE_ID,
-        page_index,
-        page_index - ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, FILE_ID ORDER BY page_index) as grp
-    from valid_detections_corrected
-    where is_corrected_header = false
-),
-
-contiguous_groups as (
-    select
-        PACKETNUMBER,
-        FILE_ID,
-        grp,
-        MIN(page_index) as first_page,
-        MAX(page_index) as last_page,
-        ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, FILE_ID ORDER BY MIN(page_index)) as group_rn
-    from contiguous_pages
-    group by PACKETNUMBER, FILE_ID, grp
+        vdc.PACKETNUMBER,
+        vdc.FILE_ID,
+        vdc.page_index,
+        vdc.is_valid,
+        COALESCE(
+            SUM(CASE WHEN hb.page_index IS NOT NULL THEN 1 ELSE 0 END)
+                OVER (PARTITION BY vdc.PACKETNUMBER, vdc.FILE_ID ORDER BY vdc.page_index
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+            0
+        ) as header_group
+    from valid_detections_corrected vdc
+    left join hallnote_boundaries hb
+        on hb.FILE_ID = vdc.FILE_ID and hb.page_index = vdc.page_index
+    where vdc.is_corrected_header = false
 ),
 
 first_contiguous_group as (
     select
         PACKETNUMBER,
         FILE_ID,
-        first_page,
-        last_page as last_page_in_group
-    from contiguous_groups
-    where group_rn = 1
+        MIN(page_index) as first_page,
+        MAX(page_index) as last_page_in_group
+    from contiguous_pages
+    where header_group = 1
+    group by PACKETNUMBER, FILE_ID
 ),
 
 best_valid as (
