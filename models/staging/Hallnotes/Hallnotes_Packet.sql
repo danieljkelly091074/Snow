@@ -254,33 +254,67 @@ valid_deduplicated as (
     group by PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, page_index, max_page_index
 ),
 
+supplementary_pages as (
+    select
+        FILE_ID,
+        page_index
+    from all_detections_raw
+    where is_supplementary = true
+),
+
+supplementary_assigned as (
+    select
+        vd.PACKETNUMBER,
+        vd.FILE_ID,
+        sp.page_index
+    from supplementary_pages sp
+    join (
+        select PACKETNUMBER, FILE_ID, page_index,
+               LEAD(page_index) OVER (PARTITION BY FILE_ID ORDER BY page_index) as next_valid_page
+        from valid_detections_corrected
+        where is_corrected_header = false
+    ) vd
+        on vd.FILE_ID = sp.FILE_ID
+        and sp.page_index > vd.page_index
+        and sp.page_index < COALESCE(vd.next_valid_page, sp.page_index + 999)
+),
+
 contiguous_pages as (
     select
-        vdc.PACKETNUMBER,
-        vdc.FILE_ID,
-        vdc.page_index,
-        vdc.is_valid,
-        COALESCE(
-            SUM(CASE WHEN hb.page_index IS NOT NULL THEN 1 ELSE 0 END)
-                OVER (PARTITION BY vdc.PACKETNUMBER, vdc.FILE_ID ORDER BY vdc.page_index
-                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
-            0
-        ) as header_group
-    from valid_detections_corrected vdc
-    left join hallnote_boundaries hb
-        on hb.FILE_ID = vdc.FILE_ID and hb.page_index = vdc.page_index
-    where vdc.is_corrected_header = false
+        PACKETNUMBER,
+        FILE_ID,
+        page_index,
+        page_index - ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, FILE_ID ORDER BY page_index) as grp
+    from (
+        select PACKETNUMBER, FILE_ID, page_index
+        from valid_detections_corrected
+        where is_corrected_header = false
+        union all
+        select PACKETNUMBER, FILE_ID, page_index
+        from supplementary_assigned
+    )
+),
+
+contiguous_groups as (
+    select
+        PACKETNUMBER,
+        FILE_ID,
+        grp,
+        MIN(page_index) as first_page,
+        MAX(page_index) as last_page,
+        ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, FILE_ID ORDER BY MIN(page_index)) as group_rn
+    from contiguous_pages
+    group by PACKETNUMBER, FILE_ID, grp
 ),
 
 first_contiguous_group as (
     select
         PACKETNUMBER,
         FILE_ID,
-        MIN(page_index) as first_page,
-        MAX(page_index) as last_page_in_group
-    from contiguous_pages
-    where header_group = 1
-    group by PACKETNUMBER, FILE_ID
+        first_page,
+        last_page as last_page_in_group
+    from contiguous_groups
+    where group_rn = 1
 ),
 
 best_valid as (
@@ -300,7 +334,8 @@ best_valid as (
             vd.max_page_index
         ) as PAGE_END_RAW,
         LAG(vd.PAGE_INDEX) OVER (PARTITION BY vd.FILE_ID ORDER BY vd.PAGE_INDEX) as prev_valid_start,
-        fcg.last_page_in_group
+        fcg.last_page_in_group,
+        LAG(fcg.last_page_in_group) OVER (PARTITION BY vd.FILE_ID ORDER BY vd.PAGE_INDEX) as prev_last_page_in_group
     from valid_deduplicated vd
     left join first_contiguous_group fcg
         on fcg.PACKETNUMBER = vd.PACKETNUMBER and fcg.FILE_ID = vd.FILE_ID
@@ -331,7 +366,12 @@ page_adjusted as (
                and inv.page_index > COALESCE(bv.prev_valid_start, -1)
                and (inv.ACCOUNTCODE = bv.ACCOUNTCODE or inv.PACKETNUMBER = bv.ACCOUNTCODE)
             ),
-            bv.PAGE_INDEX
+            CASE
+                WHEN bv.prev_last_page_in_group IS NOT NULL
+                     AND bv.PAGE_INDEX <= bv.prev_last_page_in_group
+                THEN bv.prev_last_page_in_group + 1
+                ELSE bv.PAGE_INDEX
+            END
         ) as PAGE_INDEX,
         bv.PAGE_INDEX as detected_page,
         bv.max_page_index,
@@ -392,7 +432,7 @@ hallnote_end_boundary as (
         where CONTAINS(UPPER(page_content), 'ARTICLE DISCREPANCY')
     ) c_supp
         on c_supp.FILE_ID = pae.FILE_ID
-        and c_supp.page_index > pae.PAGE_INDEX
+        and c_supp.page_index > COALESCE(pae.last_page_in_group, pae.PAGE_INDEX)
         and c_supp.page_index <= pae.max_possible_end
     group by pae.PACKETNUMBER, pae.FILE_ID, pae.PAGE_INDEX, pae.max_possible_end
 ),
