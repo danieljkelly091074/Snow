@@ -426,100 +426,114 @@ final_pages as (
         and heb.PAGE_INDEX = pae.PAGE_INDEX
 ),
 
+final_pages_with_lag as (
+    select
+        fp.*,
+        LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) as prev_page_end
+    from final_pages fp
+),
+
 final_pages_adjusted as (
     select
-        fp.PACKETNUMBER,
-        fp.ACCOUNTCODE,
-        fp.RECEIVEDDATE,
-        fp.FILE_ID,
-        fp.CREATED_AT,
-        fp.MODIFIED_AT,
-        fp._FIVETRAN_FILE_PATH,
-        fp._FIVETRAN_SYNCED,
-        fp.detected_page,
+        fpl.PACKETNUMBER,
+        fpl.ACCOUNTCODE,
+        fpl.RECEIVEDDATE,
+        fpl.FILE_ID,
+        fpl.CREATED_AT,
+        fpl.MODIFIED_AT,
+        fpl._FIVETRAN_FILE_PATH,
+        fpl._FIVETRAN_SYNCED,
+        fpl.detected_page,
         CASE
-            WHEN LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) IS NOT NULL
+            WHEN fpl.prev_page_end IS NOT NULL
                  AND EXISTS (
                     select 1 from cleaned c_gap
-                    where c_gap.FILE_ID = fp.FILE_ID
-                      and c_gap.page_index > LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX)
-                      and c_gap.page_index <= fp.PAGE_INDEX
+                    where c_gap.FILE_ID = fpl.FILE_ID
+                      and c_gap.page_index > fpl.prev_page_end
+                      and c_gap.page_index <= fpl.PAGE_INDEX
                       and CONTAINS(UPPER(c_gap.page_content), 'ARTICLE DISCREPANCY')
                  )
-            THEN LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) + 1
-            ELSE fp.PAGE_INDEX
+            THEN fpl.prev_page_end + 1
+            ELSE fpl.PAGE_INDEX
         END as PAGE_INDEX,
         CASE
-            WHEN LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) IS NOT NULL
+            WHEN fpl.prev_page_end IS NOT NULL
                  AND EXISTS (
                     select 1 from cleaned c_gap
-                    where c_gap.FILE_ID = fp.FILE_ID
-                      and c_gap.page_index > LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX)
-                      and c_gap.page_index <= fp.PAGE_INDEX
+                    where c_gap.FILE_ID = fpl.FILE_ID
+                      and c_gap.page_index > fpl.prev_page_end
+                      and c_gap.page_index <= fpl.PAGE_INDEX
                       and CONTAINS(UPPER(c_gap.page_content), 'ARTICLE DISCREPANCY')
                  )
             THEN CASE
                 WHEN EXISTS (
                     select 1 from cleaned c_mid
-                    where c_mid.FILE_ID = fp.FILE_ID
-                      and c_mid.page_index > LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) + 1
-                      and c_mid.page_index < fp.detected_page
+                    where c_mid.FILE_ID = fpl.FILE_ID
+                      and c_mid.page_index > fpl.prev_page_end + 1
+                      and c_mid.page_index < fpl.detected_page
                       and CONTAINS(UPPER(c_mid.page_content), 'ARTICLE DISCREPANCY')
                 )
-                THEN fp.detected_page - 1
-                ELSE fp.detected_page
+                THEN fpl.detected_page - 1
+                ELSE fpl.detected_page
             END
-            ELSE fp.PAGE_END
+            ELSE fpl.PAGE_END
         END as PAGE_END
-    from final_pages fp
+    from final_pages_with_lag fpl
+),
+
+final_pages_adjusted_lag as (
+    select
+        fpa.*,
+        LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) as prev_page_end_2
+    from final_pages_adjusted fpa
 ),
 
 final_pages_adjusted_2 as (
     select
-        fpa.PACKETNUMBER,
-        fpa.ACCOUNTCODE,
-        fpa.RECEIVEDDATE,
-        fpa.FILE_ID,
-        fpa.CREATED_AT,
-        fpa.MODIFIED_AT,
-        fpa._FIVETRAN_FILE_PATH,
-        fpa._FIVETRAN_SYNCED,
-        fpa.detected_page,
+        fpal.PACKETNUMBER,
+        fpal.ACCOUNTCODE,
+        fpal.RECEIVEDDATE,
+        fpal.FILE_ID,
+        fpal.CREATED_AT,
+        fpal.MODIFIED_AT,
+        fpal._FIVETRAN_FILE_PATH,
+        fpal._FIVETRAN_SYNCED,
+        fpal.detected_page,
         CASE
-            WHEN LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) IS NOT NULL
+            WHEN fpal.prev_page_end_2 IS NOT NULL
                  AND EXISTS (
                     select 1 from cleaned c_gap
-                    where c_gap.FILE_ID = fpa.FILE_ID
-                      and c_gap.page_index > LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX)
-                      and c_gap.page_index <= fpa.PAGE_INDEX
+                    where c_gap.FILE_ID = fpal.FILE_ID
+                      and c_gap.page_index > fpal.prev_page_end_2
+                      and c_gap.page_index <= fpal.PAGE_INDEX
                       and CONTAINS(UPPER(c_gap.page_content), 'ARTICLE DISCREPANCY')
                  )
-            THEN LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) + 1
-            ELSE fpa.PAGE_INDEX
+            THEN fpal.prev_page_end_2 + 1
+            ELSE fpal.PAGE_INDEX
         END as PAGE_INDEX,
         CASE
-            WHEN LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) IS NOT NULL
+            WHEN fpal.prev_page_end_2 IS NOT NULL
                  AND EXISTS (
                     select 1 from cleaned c_gap
-                    where c_gap.FILE_ID = fpa.FILE_ID
-                      and c_gap.page_index > LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX)
-                      and c_gap.page_index <= fpa.PAGE_INDEX
+                    where c_gap.FILE_ID = fpal.FILE_ID
+                      and c_gap.page_index > fpal.prev_page_end_2
+                      and c_gap.page_index <= fpal.PAGE_INDEX
                       and CONTAINS(UPPER(c_gap.page_content), 'ARTICLE DISCREPANCY')
                  )
             THEN CASE
                 WHEN EXISTS (
                     select 1 from cleaned c_mid
-                    where c_mid.FILE_ID = fpa.FILE_ID
-                      and c_mid.page_index > LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) + 1
-                      and c_mid.page_index < fpa.detected_page
+                    where c_mid.FILE_ID = fpal.FILE_ID
+                      and c_mid.page_index > fpal.prev_page_end_2 + 1
+                      and c_mid.page_index < fpal.detected_page
                       and CONTAINS(UPPER(c_mid.page_content), 'ARTICLE DISCREPANCY')
                 )
-                THEN fpa.detected_page - 1
-                ELSE fpa.detected_page
+                THEN fpal.detected_page - 1
+                ELSE fpal.detected_page
             END
-            ELSE fpa.PAGE_END
+            ELSE fpal.PAGE_END
         END as PAGE_END
-    from final_pages_adjusted fpa
+    from final_pages_adjusted_lag fpal
 ),
 
 enriched as (
