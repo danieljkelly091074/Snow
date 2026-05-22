@@ -410,6 +410,7 @@ final_pages as (
         pae.PAGE_INDEX,
         pae.max_page_index,
         pae.last_page_in_group,
+        pae.detected_page,
         CASE
             WHEN pae.PAGE_INDEX < pae.detected_page THEN pae.detected_page
             ELSE LEAST(
