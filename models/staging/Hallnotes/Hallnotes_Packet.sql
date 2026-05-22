@@ -338,17 +338,109 @@ page_adjusted as (
     from best_valid bv
 ),
 
-final_pages as (
+page_adjusted_with_end as (
     select
         pa.*,
+        COALESCE(
+            LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
+            pa.max_page_index
+        ) as max_possible_end
+    from page_adjusted pa
+),
+
+hallnote_end_boundary as (
+    select
+        pae.PACKETNUMBER,
+        pae.FILE_ID,
+        pae.PAGE_INDEX,
+        pae.max_possible_end,
+        MIN(CASE
+            WHEN hb_pkt.boundary_packet != pae.PACKETNUMBER
+                 AND hb_pkt.page_index > pae.PAGE_INDEX
+            THEN hb_pkt.page_index - 1
+            ELSE NULL
+        END) as end_by_next_diff_hallnote,
+        MIN(CASE
+            WHEN hb_pkt.boundary_packet = pae.PACKETNUMBER
+                 AND hb_pkt.page_index > pae.PAGE_INDEX
+            THEN hb_pkt.page_index
+            ELSE NULL
+        END) as own_hallnote_after_start,
+        MAX(CASE
+            WHEN hb_pkt.boundary_packet = pae.PACKETNUMBER
+                 AND hb_pkt.page_index = pae.PAGE_INDEX
+            THEN true
+            ELSE false
+        END) as start_is_own_hallnote,
+        MAX(CASE
+            WHEN c_supp.page_index IS NOT NULL THEN true
+            ELSE false
+        END) as has_supplementary_content
+    from page_adjusted_with_end pae
+    left join (
+        select
+            c.FILE_ID,
+            c.page_index,
+            UPPER(COALESCE(
+                REGEXP_SUBSTR(REPLACE(TRIM(c.result:barcode_value::VARCHAR), ' ', ''), '[0-9]{4,}[A-Za-z]{0,2}'),
+                c.result:barcode_value::VARCHAR
+            )) as boundary_packet
+        from cleaned c
+        where CONTAINS(UPPER(c.page_content), 'HALLNOTE')
+          and CONTAINS(UPPER(c.page_content), 'PACKET TYPE:')
+          and NOT CONTAINS(UPPER(c.page_content), 'ARTICLE DISCREPANCY NOTE')
+    ) hb_pkt
+        on hb_pkt.FILE_ID = pae.FILE_ID
+    left join (
+        select FILE_ID, page_index
+        from cleaned
+        where CONTAINS(UPPER(page_content), 'ARTICLE DISCREPANCY')
+    ) c_supp
+        on c_supp.FILE_ID = pae.FILE_ID
+        and c_supp.page_index > pae.PAGE_INDEX
+        and c_supp.page_index <= pae.max_possible_end
+    group by pae.PACKETNUMBER, pae.FILE_ID, pae.PAGE_INDEX, pae.max_possible_end
+),
+
+final_pages as (
+    select
+        pae.PACKETNUMBER,
+        pae.ACCOUNTCODE,
+        pae.RECEIVEDDATE,
+        pae.FILE_ID,
+        pae.CREATED_AT,
+        pae.MODIFIED_AT,
+        pae._FIVETRAN_FILE_PATH,
+        pae._FIVETRAN_SYNCED,
+        pae.PAGE_INDEX,
+        pae.max_page_index,
+        pae.last_page_in_group,
         LEAST(
             COALESCE(
-                LEAD(pa.PAGE_INDEX) OVER (PARTITION BY pa.FILE_ID ORDER BY pa.PAGE_INDEX) - 1,
-                LEAST(pa.max_page_index, pa.PAGE_INDEX + 5)
+                CASE
+                    WHEN heb.start_is_own_hallnote = false
+                         AND heb.own_hallnote_after_start IS NOT NULL
+                         AND heb.own_hallnote_after_start <= pae.max_possible_end
+                         AND heb.has_supplementary_content = false
+                    THEN heb.own_hallnote_after_start
+                    WHEN heb.start_is_own_hallnote = true
+                         AND heb.own_hallnote_after_start IS NOT NULL
+                         AND heb.own_hallnote_after_start <= pae.max_possible_end
+                    THEN heb.own_hallnote_after_start - 1
+                    ELSE NULL
+                END,
+                heb.end_by_next_diff_hallnote,
+                pae.max_possible_end,
+                LEAST(pae.max_page_index, pae.PAGE_INDEX + 5)
             ),
-            COALESCE(pa.last_page_in_group, pa.PAGE_INDEX + 5)
+            COALESCE(heb.end_by_next_diff_hallnote, pae.max_possible_end, LEAST(pae.max_page_index, pae.PAGE_INDEX + 5)),
+            COALESCE(pae.max_possible_end, LEAST(pae.max_page_index, pae.PAGE_INDEX + 5))
         ) as PAGE_END
-    from page_adjusted pa
+    from page_adjusted_with_end pae
+    left join hallnote_end_boundary heb
+        on heb.FILE_ID = pae.FILE_ID
+        and heb.PACKETNUMBER = pae.PACKETNUMBER
+        and heb.PAGE_INDEX = pae.PAGE_INDEX
 ),
 
 enriched as (
