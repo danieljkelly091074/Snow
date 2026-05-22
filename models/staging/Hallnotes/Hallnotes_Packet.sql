@@ -537,6 +537,43 @@ final_pages_adjusted_2 as (
     from final_pages_adjusted_lag fpal
 ),
 
+final_pages_with_gaps as (
+    select
+        fpa2.*,
+        LAG(fpa2.PAGE_END) OVER (PARTITION BY fpa2.FILE_ID ORDER BY fpa2.PAGE_INDEX) as prev_end_3,
+        LAG(fpa2.detected_page) OVER (PARTITION BY fpa2.FILE_ID ORDER BY fpa2.PAGE_INDEX) as prev_detected_3
+    from final_pages_adjusted_2 fpa2
+),
+
+final_pages_gap_shift as (
+    select
+        fpg.*,
+        CASE
+            WHEN fpg.prev_end_3 IS NOT NULL
+                 AND fpg.prev_end_3 + 1 < fpg.PAGE_INDEX
+                 AND fpg.prev_detected_3 > fpg.prev_end_3
+            THEN fpg.PAGE_INDEX - (fpg.prev_end_3 + 1)
+            ELSE 0
+        END as gap_size
+    from final_pages_with_gaps fpg
+),
+
+final_pages_gap_closed as (
+    select
+        fgs.PACKETNUMBER,
+        fgs.ACCOUNTCODE,
+        fgs.RECEIVEDDATE,
+        fgs.FILE_ID,
+        fgs.CREATED_AT,
+        fgs.MODIFIED_AT,
+        fgs._FIVETRAN_FILE_PATH,
+        fgs._FIVETRAN_SYNCED,
+        fgs.detected_page,
+        fgs.PAGE_INDEX - SUM(fgs.gap_size) OVER (PARTITION BY fgs.FILE_ID ORDER BY fgs.PAGE_INDEX ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as PAGE_INDEX,
+        fgs.PAGE_END - SUM(fgs.gap_size) OVER (PARTITION BY fgs.FILE_ID ORDER BY fgs.PAGE_INDEX ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as PAGE_END
+    from final_pages_gap_shift fgs
+),
+
 enriched as (
     select
         f.PACKETNUMBER,
@@ -549,7 +586,7 @@ enriched as (
         f._FIVETRAN_SYNCED,
         f.PAGE_INDEX,
         f.PAGE_END
-    from final_pages_adjusted_2 f
+    from final_pages_gap_closed f
     left join (
         select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
                ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER ORDER BY COUNTER DESC) as rn
