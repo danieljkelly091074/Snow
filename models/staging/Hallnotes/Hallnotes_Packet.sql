@@ -333,6 +333,7 @@ page_adjusted as (
             ),
             bv.PAGE_INDEX
         ) as PAGE_INDEX,
+        bv.PAGE_INDEX as detected_page,
         bv.max_page_index,
         bv.last_page_in_group
     from best_valid bv
@@ -363,19 +364,13 @@ hallnote_end_boundary as (
         MIN(CASE
             WHEN hb_pkt.boundary_packet = pae.PACKETNUMBER
                  AND hb_pkt.page_index > pae.PAGE_INDEX
-            THEN hb_pkt.page_index
+            THEN hb_pkt.page_index - 1
             ELSE NULL
-        END) as own_hallnote_after_start,
-        MAX(CASE
-            WHEN hb_pkt.boundary_packet = pae.PACKETNUMBER
-                 AND hb_pkt.page_index = pae.PAGE_INDEX
-            THEN true
-            ELSE false
-        END) as start_is_own_hallnote,
-        MAX(CASE
-            WHEN c_supp.page_index IS NOT NULL THEN true
-            ELSE false
-        END) as has_supplementary_content
+        END) as end_by_own_dup_hallnote,
+        MIN(CASE
+            WHEN c_supp.page_index IS NOT NULL THEN c_supp.page_index - 1
+            ELSE NULL
+        END) as end_by_discrepancy
     from page_adjusted_with_end pae
     left join (
         select
@@ -415,32 +410,116 @@ final_pages as (
         pae.PAGE_INDEX,
         pae.max_page_index,
         pae.last_page_in_group,
-        LEAST(
-            COALESCE(
-                CASE
-                    WHEN heb.start_is_own_hallnote = false
-                         AND heb.own_hallnote_after_start IS NOT NULL
-                         AND heb.own_hallnote_after_start <= pae.max_possible_end
-                         AND heb.has_supplementary_content = false
-                    THEN heb.own_hallnote_after_start
-                    WHEN heb.start_is_own_hallnote = true
-                         AND heb.own_hallnote_after_start IS NOT NULL
-                         AND heb.own_hallnote_after_start <= pae.max_possible_end
-                    THEN heb.own_hallnote_after_start - 1
-                    ELSE NULL
-                END,
-                heb.end_by_next_diff_hallnote,
-                pae.max_possible_end,
-                LEAST(pae.max_page_index, pae.PAGE_INDEX + 5)
-            ),
-            COALESCE(heb.end_by_next_diff_hallnote, pae.max_possible_end, LEAST(pae.max_page_index, pae.PAGE_INDEX + 5)),
-            COALESCE(pae.max_possible_end, LEAST(pae.max_page_index, pae.PAGE_INDEX + 5))
-        ) as PAGE_END
+        CASE
+            WHEN pae.PAGE_INDEX < pae.detected_page THEN pae.detected_page
+            ELSE LEAST(
+                COALESCE(heb.end_by_own_dup_hallnote, heb.end_by_next_diff_hallnote, pae.max_possible_end, LEAST(pae.max_page_index, pae.PAGE_INDEX + 5)),
+                COALESCE(heb.end_by_discrepancy, heb.end_by_next_diff_hallnote, pae.max_possible_end, LEAST(pae.max_page_index, pae.PAGE_INDEX + 5)),
+                COALESCE(heb.end_by_next_diff_hallnote, pae.max_possible_end, LEAST(pae.max_page_index, pae.PAGE_INDEX + 5)),
+                COALESCE(pae.max_possible_end, LEAST(pae.max_page_index, pae.PAGE_INDEX + 5))
+            )
+        END as PAGE_END
     from page_adjusted_with_end pae
     left join hallnote_end_boundary heb
         on heb.FILE_ID = pae.FILE_ID
         and heb.PACKETNUMBER = pae.PACKETNUMBER
         and heb.PAGE_INDEX = pae.PAGE_INDEX
+),
+
+final_pages_adjusted as (
+    select
+        fp.PACKETNUMBER,
+        fp.ACCOUNTCODE,
+        fp.RECEIVEDDATE,
+        fp.FILE_ID,
+        fp.CREATED_AT,
+        fp.MODIFIED_AT,
+        fp._FIVETRAN_FILE_PATH,
+        fp._FIVETRAN_SYNCED,
+        fp.detected_page,
+        CASE
+            WHEN LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) IS NOT NULL
+                 AND EXISTS (
+                    select 1 from cleaned c_gap
+                    where c_gap.FILE_ID = fp.FILE_ID
+                      and c_gap.page_index > LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX)
+                      and c_gap.page_index <= fp.PAGE_INDEX
+                      and CONTAINS(UPPER(c_gap.page_content), 'ARTICLE DISCREPANCY')
+                 )
+            THEN LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) + 1
+            ELSE fp.PAGE_INDEX
+        END as PAGE_INDEX,
+        CASE
+            WHEN LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) IS NOT NULL
+                 AND EXISTS (
+                    select 1 from cleaned c_gap
+                    where c_gap.FILE_ID = fp.FILE_ID
+                      and c_gap.page_index > LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX)
+                      and c_gap.page_index <= fp.PAGE_INDEX
+                      and CONTAINS(UPPER(c_gap.page_content), 'ARTICLE DISCREPANCY')
+                 )
+            THEN CASE
+                WHEN EXISTS (
+                    select 1 from cleaned c_mid
+                    where c_mid.FILE_ID = fp.FILE_ID
+                      and c_mid.page_index > LAG(fp.PAGE_END) OVER (PARTITION BY fp.FILE_ID ORDER BY fp.PAGE_INDEX) + 1
+                      and c_mid.page_index < fp.detected_page
+                      and CONTAINS(UPPER(c_mid.page_content), 'ARTICLE DISCREPANCY')
+                )
+                THEN fp.detected_page - 1
+                ELSE fp.detected_page
+            END
+            ELSE fp.PAGE_END
+        END as PAGE_END
+    from final_pages fp
+),
+
+final_pages_adjusted_2 as (
+    select
+        fpa.PACKETNUMBER,
+        fpa.ACCOUNTCODE,
+        fpa.RECEIVEDDATE,
+        fpa.FILE_ID,
+        fpa.CREATED_AT,
+        fpa.MODIFIED_AT,
+        fpa._FIVETRAN_FILE_PATH,
+        fpa._FIVETRAN_SYNCED,
+        fpa.detected_page,
+        CASE
+            WHEN LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) IS NOT NULL
+                 AND EXISTS (
+                    select 1 from cleaned c_gap
+                    where c_gap.FILE_ID = fpa.FILE_ID
+                      and c_gap.page_index > LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX)
+                      and c_gap.page_index <= fpa.PAGE_INDEX
+                      and CONTAINS(UPPER(c_gap.page_content), 'ARTICLE DISCREPANCY')
+                 )
+            THEN LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) + 1
+            ELSE fpa.PAGE_INDEX
+        END as PAGE_INDEX,
+        CASE
+            WHEN LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) IS NOT NULL
+                 AND EXISTS (
+                    select 1 from cleaned c_gap
+                    where c_gap.FILE_ID = fpa.FILE_ID
+                      and c_gap.page_index > LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX)
+                      and c_gap.page_index <= fpa.PAGE_INDEX
+                      and CONTAINS(UPPER(c_gap.page_content), 'ARTICLE DISCREPANCY')
+                 )
+            THEN CASE
+                WHEN EXISTS (
+                    select 1 from cleaned c_mid
+                    where c_mid.FILE_ID = fpa.FILE_ID
+                      and c_mid.page_index > LAG(fpa.PAGE_END) OVER (PARTITION BY fpa.FILE_ID ORDER BY fpa.PAGE_INDEX) + 1
+                      and c_mid.page_index < fpa.detected_page
+                      and CONTAINS(UPPER(c_mid.page_content), 'ARTICLE DISCREPANCY')
+                )
+                THEN fpa.detected_page - 1
+                ELSE fpa.detected_page
+            END
+            ELSE fpa.PAGE_END
+        END as PAGE_END
+    from final_pages_adjusted fpa
 ),
 
 enriched as (
@@ -455,7 +534,7 @@ enriched as (
         f._FIVETRAN_SYNCED,
         f.PAGE_INDEX,
         f.PAGE_END
-    from final_pages f
+    from final_pages_adjusted_2 f
     left join (
         select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
                ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER ORDER BY COUNTER DESC) as rn
