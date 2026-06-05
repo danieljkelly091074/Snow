@@ -1,5 +1,7 @@
 -- dbt incremental model: hallnotes_packetnumber.sql
 
+-- dbt incremental model: hallnotes_packetnumber.sql
+
 {{
     config(
         materialized='incremental',
