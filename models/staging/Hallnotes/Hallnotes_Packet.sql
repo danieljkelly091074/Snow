@@ -4,7 +4,7 @@
     config(
         materialized='incremental',
         unique_key=['PACKETNUMBER', 'RECEIVEDDATE', 'FILE_ID'],
-        incremental_strategy='merge'
+        incremental_strategy='delete+insert'
     )
 }}
 
@@ -16,11 +16,18 @@ with source_file as (
         h._FIVETRAN_FILE_PATH,
         h._FIVETRAN_SYNCED
     from {{ source('sharepoint', 'HALLNOTES') }} h
-    inner join directory('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES') d
-        on d.RELATIVE_PATH = h._FIVETRAN_FILE_PATH
     where h._FIVETRAN_FILE_PATH like 'root/%'
+      and exists (
+          select 1
+          from directory('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES') d
+          where d.RELATIVE_PATH = h._FIVETRAN_FILE_PATH
+      )
     {% if is_incremental() %}
-      and h.FILE_ID not in (select FILE_ID from {{ this }})
+      and not exists (
+          select 1
+          from {{ this }} p
+          where p.FILE_ID = h.FILE_ID
+      )
     {% endif %}
 ),
 
@@ -198,13 +205,28 @@ fuzzy_matches as (
     where kp.PACKETNUMBER is null
 ),
 
+strip_candidates as (
+    select distinct v.FILE_ID, v.page_index, v.PACKETNUMBER,
+        SUBSTR(v.PACKETNUMBER, 2) as stripped
+    from valid_detections_raw v
+    inner join known_packets kp on kp.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2)
+    where REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$')
+),
+
+strip_conflicts as (
+    select sc.FILE_ID, sc.page_index, sc.PACKETNUMBER
+    from strip_candidates sc
+    inner join known_packets kp on kp.PACKETNUMBER LIKE LEFT(sc.PACKETNUMBER, LENGTH(sc.PACKETNUMBER) - 1) || '%'
+        and kp.PACKETNUMBER != sc.stripped
+),
+
 valid_detections as (
     select
         COALESCE(
             CASE WHEN kp_direct.PACKETNUMBER IS NOT NULL THEN v.PACKETNUMBER ELSE NULL END,
             CASE WHEN v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER AND kp_text.PACKETNUMBER IS NOT NULL THEN v.PACKET_TEXT ELSE NULL END,
             fm.resolved_pkt,
-            CASE WHEN REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$') AND kp_strip.PACKETNUMBER IS NOT NULL AND kp_strip_other.PACKETNUMBER IS NULL THEN SUBSTR(v.PACKETNUMBER, 2) ELSE NULL END,
+            CASE WHEN sc.stripped IS NOT NULL AND sconf.PACKETNUMBER IS NULL THEN sc.stripped ELSE NULL END,
             v.PACKETNUMBER
         ) as PACKETNUMBER,
         v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid, v.is_hallnote_header
@@ -212,12 +234,12 @@ valid_detections as (
     left join known_packets kp_direct on kp_direct.PACKETNUMBER = v.PACKETNUMBER
     left join known_packets kp_text on v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER AND kp_text.PACKETNUMBER = v.PACKET_TEXT
     left join fuzzy_matches fm on fm.FILE_ID = v.FILE_ID and fm.page_index = v.page_index
-    left join known_packets kp_strip on REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$') AND kp_strip.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2)
-    left join known_packets kp_strip_other on REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$') AND kp_strip_other.PACKETNUMBER LIKE LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) || '%' AND kp_strip_other.PACKETNUMBER != SUBSTR(v.PACKETNUMBER, 2)
+    left join strip_candidates sc on sc.FILE_ID = v.FILE_ID and sc.page_index = v.page_index
+    left join strip_conflicts sconf on sconf.FILE_ID = v.FILE_ID and sconf.page_index = v.page_index
     where kp_direct.PACKETNUMBER IS NOT NULL
        OR kp_text.PACKETNUMBER IS NOT NULL
        OR fm.resolved_pkt IS NOT NULL
-       OR (REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$') AND kp_strip.PACKETNUMBER IS NOT NULL AND kp_strip_other.PACKETNUMBER IS NULL)
+       OR (sc.stripped IS NOT NULL AND sconf.PACKETNUMBER IS NULL)
 ),
 
 valid_detections_corrected as (
@@ -286,19 +308,18 @@ gaps_between_same_packet as (
         a.PAGE_INDEX as earlier_start,
         a.MAX_PAGE as earlier_end,
         b.PAGE_INDEX as later_start,
-        CASE WHEN cnt.intervening_count > 0 THEN true ELSE false END as has_intervening
+        CASE WHEN MIN(other.PAGE_INDEX) IS NOT NULL THEN true ELSE false END as has_intervening
     from valid_deduplicated_raw a
     join valid_deduplicated_raw b
         on a.FILE_ID = b.FILE_ID
         and a.PACKETNUMBER = b.PACKETNUMBER
         and a.PAGE_INDEX < b.PAGE_INDEX
-    left join (
-        select o.FILE_ID, o2.PACKETNUMBER as orig_pkt, o2.MAX_PAGE as earlier_end, o3.PAGE_INDEX as later_start, COUNT(*) as intervening_count
-        from valid_deduplicated_raw o
-        join valid_deduplicated_raw o2 on o.FILE_ID = o2.FILE_ID and o.PACKETNUMBER != o2.PACKETNUMBER and o.PAGE_INDEX > o2.MAX_PAGE
-        join valid_deduplicated_raw o3 on o.FILE_ID = o3.FILE_ID and o3.PACKETNUMBER = o2.PACKETNUMBER and o3.PAGE_INDEX > o2.PAGE_INDEX and o.PAGE_INDEX < o3.PAGE_INDEX
-        group by o.FILE_ID, o2.PACKETNUMBER, o2.MAX_PAGE, o3.PAGE_INDEX
-    ) cnt on cnt.FILE_ID = a.FILE_ID and cnt.orig_pkt = a.PACKETNUMBER and cnt.earlier_end = a.MAX_PAGE and cnt.later_start = b.PAGE_INDEX
+    left join valid_deduplicated_raw other
+        on other.FILE_ID = a.FILE_ID
+        and other.PACKETNUMBER != a.PACKETNUMBER
+        and other.PAGE_INDEX > a.MAX_PAGE
+        and other.PAGE_INDEX < b.PAGE_INDEX
+    group by a.FILE_ID, a.PACKETNUMBER, a.PAGE_INDEX, a.MAX_PAGE, b.PAGE_INDEX
 ),
 
 rows_to_remove as (
@@ -363,8 +384,7 @@ contiguous_groups as (
         FILE_ID,
         grp,
         MIN(page_index) as first_page,
-        MAX(page_index) as last_page,
-        ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, FILE_ID ORDER BY MIN(page_index)) as group_rn
+        MAX(page_index) as last_page
     from contiguous_pages
     group by PACKETNUMBER, FILE_ID, grp
 ),
@@ -447,7 +467,9 @@ enriched as (
 )
 
 select e.* from enriched e
-left join {{ source('sharepoint','HALLNOTES_PACKETNUMBER') }} hp
-    on hp.PACKETNUMBER = e.PACKETNUMBER
-    and hp.RECEIVEDDATE = e.RECEIVEDDATE
-where hp.PACKETNUMBER is null
+where not exists (
+    select 1
+    from {{ source('sharepoint','HALLNOTES_PACKETNUMBER') }} hp
+    where hp.PACKETNUMBER = e.PACKETNUMBER
+      and hp.RECEIVEDDATE = e.RECEIVEDDATE
+)
