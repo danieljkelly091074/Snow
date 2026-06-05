@@ -61,9 +61,10 @@ extracted as (
         SNOWFLAKE.CORTEX.COMPLETE(
             'snowflake-llama-3.3-70b',
             CONCAT(
-                'Extract the following fields from this document text. Return ONLY a valid JSON object with these exact keys: barcode_value, account_code, received_date. If a field is not found, use null.\n\n',
+                'Extract the following fields from this document text. Return ONLY a valid JSON object with these exact keys: barcode_value, packet_text, account_code, received_date. If a field is not found, use null.\n\n',
                 'Rules:\n',
                 '- barcode_value: Look for the MAIN packet/barcode number printed prominently, usually near the top of the page. It matches these patterns: (1) Letter(s) + digits + optional letter suffix like S16582A, S2271XB, N20528, Q53047A (2) Digits + letter suffix like 405599B, 412931C, 412834C (3) Pure 5-7 digit numbers like 412905. The code is 5-10 characters total. IMPORTANT: Preserve the FULL value exactly as printed including ALL leading letters. Do NOT drop or truncate any characters. Do NOT use the "Reg No" value. Do NOT include hallmark quality marks like "A+B", "A+C", "B+", etc. - if you see "A+B 412834C", the packet number is just "412834C". The text may have OCR noise - look carefully even if text is garbled. IMPORTANT: If the page contains "Article Discrepancy Note" text, it is a supplementary page belonging to the PREVIOUS packet - it does NOT start a new packet. The barcode on such pages is the SAME as the preceding packet.\n',
+                '- packet_text: Look for a SECOND reference to the packet number in the body text of the page - typically after "Packet No", "Pkt No", "Packet:", in a table row, or in the hallnote header section. This should be read INDEPENDENTLY from barcode_value. If both exist, they should match. If you can only find one instance of the packet number on the page, return null for this field. Do NOT just copy barcode_value - only return a value if you find a genuinely separate occurrence of the packet number in the text.\n',
                 '- account_code: Look for a PRINTED/TYPED number specifically after "Account No." or "Acc No." or "Acc No:". Read ALL digits carefully - account codes can be 4 to 6 digits (e.g. 074014, 082536, 51414). Do NOT truncate - read every digit. IGNORE any handwritten account codes. IGNORE any values after "Your Ref" or "Your Ref:" - these are NOT account codes. If the value contains letters or slashes it is NOT an account code - return null. If it appears handwritten return null.\n',
                 '- received_date: Look for the RECEIVED date - this is the date at the VERY TOP of the page, usually on the first line, often prefixed with a day of the week (e.g. "Thu 30-Apr-2026"). Do NOT use "Est Comp" dates or estimated completion dates - these appear BELOW the barcode/packet number and are a DIFFERENT field entirely. If the only date you can find is labelled "Est Comp" or "Estimated Completion", return null - there is NO received date. The received date is always at the very start of the document BEFORE the barcode. Also check after "Received:". IMPORTANT: Read the day number carefully - distinguish between similar digits like 7 and 8, 1 and 7. Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
                 'Document text:\n',
@@ -104,6 +105,14 @@ all_detections_raw as (
             REGEXP_SUBSTR(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''), '^[A-Za-z]?[0-9]{4,}[A-Za-z]{0,2}$'),
             REGEXP_SUBSTR(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', ''), '[0-9]{4,}[A-Za-z]{0,2}')
         )) as PACKETNUMBER,
+        CASE
+            WHEN result:packet_text::VARCHAR IS NOT NULL
+                 AND result:packet_text::VARCHAR != 'null'
+                 AND REGEXP_LIKE(UPPER(REPLACE(TRIM(result:packet_text::VARCHAR), ' ', '')), '^[A-Za-z]?[0-9]{4,}[A-Za-z]{0,2}$')
+                 AND LENGTH(REPLACE(TRIM(result:packet_text::VARCHAR), ' ', '')) BETWEEN 5 AND 10
+            THEN UPPER(REPLACE(TRIM(result:packet_text::VARCHAR), ' ', ''))
+            ELSE NULL
+        END as PACKET_TEXT,
         NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null') as ACCOUNTCODE,
         COALESCE(
             TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY'),
@@ -128,6 +137,7 @@ all_detections_raw as (
 regex_fallback as (
     select
         UPPER(REGEXP_SUBSTR(page_content, '\\b([A-Za-z][0-9]{4,6}[A-Za-z]?)\\b', 1, 1, 'e')) as PACKETNUMBER,
+        NULL as PACKET_TEXT,
         NULL as ACCOUNTCODE,
         COALESCE(
             TRY_TO_DATE(REGEXP_SUBSTR(page_content, '(\\d{2}-[A-Za-z]{3}-\\d{4})', 1, 1, 'e'), 'DD-Mon-YYYY'),
@@ -177,13 +187,38 @@ valid_detections_raw as (
     select * from all_detections where is_valid
 ),
 
+fuzzy_matches as (
+    select v.FILE_ID, v.page_index, LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) as resolved_pkt
+    from valid_detections_raw v
+    where NOT EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
+      AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER)
+      AND EXISTS (SELECT 1 FROM valid_detections_raw sibling WHERE sibling.FILE_ID = v.FILE_ID AND sibling.ACCOUNTCODE = v.ACCOUNTCODE
+                  AND LEFT(sibling.PACKETNUMBER, LENGTH(sibling.PACKETNUMBER) - 1) = LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1)
+                  AND sibling.page_index != v.page_index)
+),
+
 valid_detections as (
     select
         COALESCE(
             CASE
-                WHEN REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]')
-                     AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
-                     AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER)
+                WHEN (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
+                      OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER))
+                THEN v.PACKETNUMBER
+                ELSE NULL
+            END,
+            CASE
+                WHEN v.PACKET_TEXT IS NOT NULL
+                     AND v.PACKET_TEXT != v.PACKETNUMBER
+                     AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKET_TEXT)
+                          OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKET_TEXT))
+                THEN v.PACKET_TEXT
+                ELSE NULL
+            END,
+            fm.resolved_pkt,
+            CASE
+                WHEN REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$')
+                     AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER LIKE LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) || '%' AND p.PACKETNUMBER != SUBSTR(v.PACKETNUMBER, 2))
+                     AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER LIKE LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) || '%' AND ap.PACKETNUMBER != SUBSTR(v.PACKETNUMBER, 2))
                      AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))
                           OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2)))
                 THEN SUBSTR(v.PACKETNUMBER, 2)
@@ -193,10 +228,16 @@ valid_detections as (
         ) as PACKETNUMBER,
         v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid, v.is_hallnote_header
     from valid_detections_raw v
+    left join fuzzy_matches fm on fm.FILE_ID = v.FILE_ID and fm.page_index = v.page_index
     where EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
        OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER)
-       OR EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))
-       OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))
+       OR (v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER
+           AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKET_TEXT)
+                OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKET_TEXT)))
+       OR fm.resolved_pkt IS NOT NULL
+       OR (REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$')
+           AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))
+                OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))))
 ),
 
 valid_detections_corrected as (
@@ -225,41 +266,48 @@ invalid_detections as (
     select * from all_detections where not is_valid
 ),
 
+valid_ordered as (
+    select
+        *,
+        LAG(PACKETNUMBER) OVER (PARTITION BY FILE_ID ORDER BY page_index) as prev_packet,
+        LAG(page_index) OVER (PARTITION BY FILE_ID ORDER BY page_index) as prev_page
+    from valid_detections_corrected
+    where is_corrected_header = false
+),
 
+packet_groups as (
+    select
+        *,
+        SUM(CASE
+            WHEN PACKETNUMBER = prev_packet AND page_index = prev_page + 1
+            THEN 0 ELSE 1
+        END) OVER (PARTITION BY FILE_ID ORDER BY page_index ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as packet_group
+    from valid_ordered
+),
 
 valid_deduplicated as (
     select
         PACKETNUMBER,
-        ACCOUNTCODE,
-        RECEIVEDDATE,
+        MAX_BY(ACCOUNTCODE, CASE WHEN ACCOUNTCODE IS NOT NULL THEN 1 ELSE 0 END) as ACCOUNTCODE,
+        MAX_BY(RECEIVEDDATE, CASE WHEN RECEIVEDDATE IS NOT NULL THEN 1 ELSE 0 END) as RECEIVEDDATE,
         FILE_ID,
-        CREATED_AT,
-        MODIFIED_AT,
-        _FIVETRAN_FILE_PATH,
-        _FIVETRAN_SYNCED,
+        MIN(CREATED_AT) as CREATED_AT,
+        MIN(MODIFIED_AT) as MODIFIED_AT,
+        MIN(_FIVETRAN_FILE_PATH) as _FIVETRAN_FILE_PATH,
+        MIN(_FIVETRAN_SYNCED) as _FIVETRAN_SYNCED,
         MIN(page_index) as PAGE_INDEX,
-        max_page_index,
-        ROW_NUMBER() over (
-            partition by PACKETNUMBER, FILE_ID
-            order by
-                case when RECEIVEDDATE is not null and ACCOUNTCODE is not null then 0
-                     when RECEIVEDDATE is not null then 1
-                     when ACCOUNTCODE is not null then 2
-                     else 3
-                end,
-                page_index
-        ) as rn
-    from valid_detections_corrected
-    where is_corrected_header = false
-    group by PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, page_index, max_page_index
+        MAX(max_page_index) as max_page_index,
+        1 as rn
+    from packet_groups
+    group by PACKETNUMBER, FILE_ID, packet_group
 ),
 
 supplementary_pages as (
     select
         FILE_ID,
         page_index
-    from all_detections_raw
-    where is_supplementary = true
+    from cleaned
+    where CONTAINS(UPPER(page_content), 'ARTICLE DISCREPANCY NOTE')
 ),
 
 supplementary_assigned as (
@@ -269,13 +317,12 @@ supplementary_assigned as (
         sp.page_index
     from supplementary_pages sp
     join (
-        select PACKETNUMBER, FILE_ID, page_index,
-               LEAD(page_index) OVER (PARTITION BY FILE_ID ORDER BY page_index) as next_valid_page
-        from valid_detections_corrected
-        where is_corrected_header = false
+        select PACKETNUMBER, FILE_ID, PAGE_INDEX as page_index,
+               LEAD(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) as next_valid_page
+        from valid_deduplicated
     ) vd
         on vd.FILE_ID = sp.FILE_ID
-        and sp.page_index > vd.page_index
+        and sp.page_index >= vd.page_index
         and sp.page_index < COALESCE(vd.next_valid_page, sp.page_index + 999)
 ),
 
