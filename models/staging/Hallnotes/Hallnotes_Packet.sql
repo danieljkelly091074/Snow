@@ -58,10 +58,10 @@ pages as (
 extracted as (
     select
         pg.*,
-        SNOWFLAKE.CORTEX.COMPLETE(
+        AI_COMPLETE(
             'snowflake-llama-3.3-70b',
             CONCAT(
-                'Extract the following fields from this document text. Return ONLY a valid JSON object with these exact keys: barcode_value, packet_text, account_code, received_date. If a field is not found, use null.\n\n',
+                'Extract the following fields from this document text. If a field is not found, use null.\n\n',
                 'Rules:\n',
                 '- barcode_value: Look for the MAIN packet/barcode number printed prominently, usually near the top of the page. It matches these patterns: (1) Letter(s) + digits + optional letter suffix like S16582A, S2271XB, N20528, Q53047A (2) Digits + letter suffix like 405599B, 412931C, 412834C (3) Pure 5-7 digit numbers like 412905. The code is 5-10 characters total. IMPORTANT: Preserve the FULL value exactly as printed including ALL leading letters. Do NOT drop or truncate any characters. Do NOT use the "Reg No" value. Do NOT include hallmark quality marks like "A+B", "A+C", "B+", etc. - if you see "A+B 412834C", the packet number is just "412834C". The text may have OCR noise - look carefully even if text is garbled. IMPORTANT: If the page contains "Article Discrepancy Note" text, it is a supplementary page belonging to the PREVIOUS packet - it does NOT start a new packet. The barcode on such pages is the SAME as the preceding packet.\n',
                 '- packet_text: Look for a SECOND reference to the packet number in the body text of the page - typically after "Packet No", "Pkt No", "Packet:", in a table row, or in the hallnote header section. This should be read INDEPENDENTLY from barcode_value. If both exist, they should match. If you can only find one instance of the packet number on the page, return null for this field. Do NOT just copy barcode_value - only return a value if you find a genuinely separate occurrence of the packet number in the text.\n',
@@ -69,7 +69,16 @@ extracted as (
                 '- received_date: Look for the RECEIVED date - this is the date at the VERY TOP of the page, usually on the first line, often prefixed with a day of the week (e.g. "Thu 30-Apr-2026"). Do NOT use "Est Comp" dates or estimated completion dates - these appear BELOW the barcode/packet number and are a DIFFERENT field entirely. If the only date you can find is labelled "Est Comp" or "Estimated Completion", return null - there is NO received date. The received date is always at the very start of the document BEFORE the barcode. Also check after "Received:". IMPORTANT: Read the day number carefully - distinguish between similar digits like 7 and 8, 1 and 7. Strip any day-of-week prefix and return in DD-Mon-YYYY format only.\n\n',
                 'Document text:\n',
                 pg.page_content
-            )
+            ),
+            response_format => {'type': 'json', 'schema': {
+                'type': 'object',
+                'properties': {
+                    'barcode_value': {'type': 'string'},
+                    'packet_text': {'type': 'string'},
+                    'account_code': {'type': 'string'},
+                    'received_date': {'type': 'string'}
+                }
+            }}
         ) as llm_response
     from pages pg
     where pg.page_content is not null
@@ -79,7 +88,7 @@ extracted as (
 cleaned as (
     select
         e.*,
-        TRY_PARSE_JSON(REGEXP_SUBSTR(llm_response, '\\{[^{}]*\\}')) as result
+        TRY_PARSE_JSON(llm_response) as result
     from extracted e
 ),
 
@@ -181,7 +190,8 @@ fuzzy_matches as (
     from valid_detections_raw v
     where NOT EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
       AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER)
-      AND EXISTS (SELECT 1 FROM valid_detections_raw sibling WHERE sibling.FILE_ID = v.FILE_ID AND sibling.ACCOUNTCODE = v.ACCOUNTCODE
+      AND EXISTS (SELECT 1 FROM valid_detections_raw sibling WHERE sibling.FILE_ID = v.FILE_ID
+                  AND (sibling.ACCOUNTCODE = v.ACCOUNTCODE OR (sibling.ACCOUNTCODE IS NULL AND v.ACCOUNTCODE IS NULL) OR v.ACCOUNTCODE IS NULL OR sibling.ACCOUNTCODE IS NULL)
                   AND LEFT(sibling.PACKETNUMBER, LENGTH(sibling.PACKETNUMBER) - 1) = LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1)
                   AND sibling.page_index != v.page_index)
 ),
@@ -270,7 +280,7 @@ packet_groups as (
     from valid_ordered
 ),
 
-valid_deduplicated as (
+valid_deduplicated_raw as (
     select
         PACKETNUMBER,
         MAX_BY(ACCOUNTCODE, CASE WHEN ACCOUNTCODE IS NOT NULL THEN 1 ELSE 0 END) as ACCOUNTCODE,
@@ -281,10 +291,49 @@ valid_deduplicated as (
         MIN(_FIVETRAN_FILE_PATH) as _FIVETRAN_FILE_PATH,
         MIN(_FIVETRAN_SYNCED) as _FIVETRAN_SYNCED,
         MIN(page_index) as PAGE_INDEX,
+        MAX(page_index) as MAX_PAGE,
         MAX(max_page_index) as max_page_index,
         1 as rn
     from packet_groups
     group by PACKETNUMBER, FILE_ID, packet_group
+),
+
+gaps_between_same_packet as (
+    select
+        a.FILE_ID,
+        a.PACKETNUMBER,
+        a.PAGE_INDEX as earlier_start,
+        a.MAX_PAGE as earlier_end,
+        b.PAGE_INDEX as later_start,
+        EXISTS (
+            select 1 from valid_deduplicated_raw other
+            where other.FILE_ID = a.FILE_ID
+              and other.PACKETNUMBER != a.PACKETNUMBER
+              and other.PAGE_INDEX > a.MAX_PAGE
+              and other.PAGE_INDEX < b.PAGE_INDEX
+        ) as has_intervening
+    from valid_deduplicated_raw a
+    join valid_deduplicated_raw b
+        on a.FILE_ID = b.FILE_ID
+        and a.PACKETNUMBER = b.PACKETNUMBER
+        and a.PAGE_INDEX < b.PAGE_INDEX
+),
+
+rows_to_remove as (
+    select distinct g.FILE_ID, g.PACKETNUMBER, g.later_start as PAGE_INDEX
+    from gaps_between_same_packet g
+    where g.has_intervening = false
+),
+
+valid_deduplicated as (
+    select vdr.*
+    from valid_deduplicated_raw vdr
+    where NOT EXISTS (
+        select 1 from rows_to_remove r
+        where r.FILE_ID = vdr.FILE_ID
+          and r.PACKETNUMBER = vdr.PACKETNUMBER
+          and r.PAGE_INDEX = vdr.PAGE_INDEX
+    )
 ),
 
 supplementary_pages as (
@@ -341,12 +390,19 @@ contiguous_groups as (
 
 first_contiguous_group as (
     select
-        PACKETNUMBER,
-        FILE_ID,
-        first_page,
-        last_page as last_page_in_group
-    from contiguous_groups
-    where group_rn = 1
+        cg.PACKETNUMBER,
+        cg.FILE_ID,
+        MIN(cg.first_page) as first_page,
+        MAX(cg.last_page) as last_page_in_group
+    from contiguous_groups cg
+    where NOT EXISTS (
+        select 1 from valid_deduplicated other
+        where other.FILE_ID = cg.FILE_ID
+          and other.PACKETNUMBER != cg.PACKETNUMBER
+          and other.PAGE_INDEX >= cg.first_page
+          and other.PAGE_INDEX <= cg.last_page
+    )
+    group by cg.PACKETNUMBER, cg.FILE_ID
 ),
 
 best_valid as (
@@ -417,3 +473,4 @@ where not exists (
     where hp.PACKETNUMBER = e.PACKETNUMBER
       and hp.RECEIVEDDATE = e.RECEIVEDDATE
 )
+
