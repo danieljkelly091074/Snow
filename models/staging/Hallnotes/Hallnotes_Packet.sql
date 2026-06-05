@@ -16,18 +16,11 @@ with source_file as (
         h._FIVETRAN_FILE_PATH,
         h._FIVETRAN_SYNCED
     from {{ source('sharepoint', 'HALLNOTES') }} h
+    inner join directory('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES') d
+        on d.RELATIVE_PATH = h._FIVETRAN_FILE_PATH
     where h._FIVETRAN_FILE_PATH like 'root/%'
-      and exists (
-          select 1
-          from directory('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES') d
-          where d.RELATIVE_PATH = h._FIVETRAN_FILE_PATH
-      )
     {% if is_incremental() %}
-      and not exists (
-          select 1
-          from {{ this }} p
-          where p.FILE_ID = h.FILE_ID
-      )
+      and h.FILE_ID not in (select FILE_ID from {{ this }})
     {% endif %}
 ),
 
@@ -185,58 +178,46 @@ valid_detections_raw as (
     select * from all_detections where is_valid
 ),
 
+known_packets as (
+    select distinct PACKETNUMBER from {{ source('forge', 'PACKET') }}
+    union
+    select distinct PACKETNUMBER from {{ source('forge', 'ARCHIVEPACKET') }}
+),
+
+fuzzy_siblings as (
+    select distinct v.FILE_ID, LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) as prefix
+    from valid_detections_raw v
+    inner join known_packets kp on kp.PACKETNUMBER = v.PACKETNUMBER
+),
+
 fuzzy_matches as (
     select v.FILE_ID, v.page_index, LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) as resolved_pkt
     from valid_detections_raw v
-    where NOT EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
-      AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER)
-      AND EXISTS (SELECT 1 FROM valid_detections_raw sibling WHERE sibling.FILE_ID = v.FILE_ID
-                  AND (sibling.ACCOUNTCODE = v.ACCOUNTCODE OR (sibling.ACCOUNTCODE IS NULL AND v.ACCOUNTCODE IS NULL) OR v.ACCOUNTCODE IS NULL OR sibling.ACCOUNTCODE IS NULL)
-                  AND LEFT(sibling.PACKETNUMBER, LENGTH(sibling.PACKETNUMBER) - 1) = LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1)
-                  AND sibling.page_index != v.page_index)
+    left join known_packets kp on kp.PACKETNUMBER = v.PACKETNUMBER
+    inner join fuzzy_siblings fs on fs.FILE_ID = v.FILE_ID and fs.prefix = LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1)
+    where kp.PACKETNUMBER is null
 ),
 
 valid_detections as (
     select
         COALESCE(
-            CASE
-                WHEN (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
-                      OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER))
-                THEN v.PACKETNUMBER
-                ELSE NULL
-            END,
-            CASE
-                WHEN v.PACKET_TEXT IS NOT NULL
-                     AND v.PACKET_TEXT != v.PACKETNUMBER
-                     AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKET_TEXT)
-                          OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKET_TEXT))
-                THEN v.PACKET_TEXT
-                ELSE NULL
-            END,
+            CASE WHEN kp_direct.PACKETNUMBER IS NOT NULL THEN v.PACKETNUMBER ELSE NULL END,
+            CASE WHEN v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER AND kp_text.PACKETNUMBER IS NOT NULL THEN v.PACKET_TEXT ELSE NULL END,
             fm.resolved_pkt,
-            CASE
-                WHEN REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$')
-                     AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER LIKE LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) || '%' AND p.PACKETNUMBER != SUBSTR(v.PACKETNUMBER, 2))
-                     AND NOT EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER LIKE LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) || '%' AND ap.PACKETNUMBER != SUBSTR(v.PACKETNUMBER, 2))
-                     AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))
-                          OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2)))
-                THEN SUBSTR(v.PACKETNUMBER, 2)
-                ELSE NULL
-            END,
+            CASE WHEN REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$') AND kp_strip.PACKETNUMBER IS NOT NULL AND kp_strip_other.PACKETNUMBER IS NULL THEN SUBSTR(v.PACKETNUMBER, 2) ELSE NULL END,
             v.PACKETNUMBER
         ) as PACKETNUMBER,
         v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid, v.is_hallnote_header
     from valid_detections_raw v
+    left join known_packets kp_direct on kp_direct.PACKETNUMBER = v.PACKETNUMBER
+    left join known_packets kp_text on v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER AND kp_text.PACKETNUMBER = v.PACKET_TEXT
     left join fuzzy_matches fm on fm.FILE_ID = v.FILE_ID and fm.page_index = v.page_index
-    where EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKETNUMBER)
-       OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKETNUMBER)
-       OR (v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER
-           AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = v.PACKET_TEXT)
-                OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = v.PACKET_TEXT)))
+    left join known_packets kp_strip on REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$') AND kp_strip.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2)
+    left join known_packets kp_strip_other on REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$') AND kp_strip_other.PACKETNUMBER LIKE LEFT(v.PACKETNUMBER, LENGTH(v.PACKETNUMBER) - 1) || '%' AND kp_strip_other.PACKETNUMBER != SUBSTR(v.PACKETNUMBER, 2)
+    where kp_direct.PACKETNUMBER IS NOT NULL
+       OR kp_text.PACKETNUMBER IS NOT NULL
        OR fm.resolved_pkt IS NOT NULL
-       OR (REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$')
-           AND (EXISTS (SELECT 1 FROM {{ source('forge', 'PACKET') }} p WHERE p.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))
-                OR EXISTS (SELECT 1 FROM {{ source('forge', 'ARCHIVEPACKET') }} ap WHERE ap.PACKETNUMBER = SUBSTR(v.PACKETNUMBER, 2))))
+       OR (REGEXP_LIKE(v.PACKETNUMBER, '^[A-Za-z][0-9]+$') AND kp_strip.PACKETNUMBER IS NOT NULL AND kp_strip_other.PACKETNUMBER IS NULL)
 ),
 
 valid_detections_corrected as (
@@ -305,18 +286,19 @@ gaps_between_same_packet as (
         a.PAGE_INDEX as earlier_start,
         a.MAX_PAGE as earlier_end,
         b.PAGE_INDEX as later_start,
-        EXISTS (
-            select 1 from valid_deduplicated_raw other
-            where other.FILE_ID = a.FILE_ID
-              and other.PACKETNUMBER != a.PACKETNUMBER
-              and other.PAGE_INDEX > a.MAX_PAGE
-              and other.PAGE_INDEX < b.PAGE_INDEX
-        ) as has_intervening
+        CASE WHEN cnt.intervening_count > 0 THEN true ELSE false END as has_intervening
     from valid_deduplicated_raw a
     join valid_deduplicated_raw b
         on a.FILE_ID = b.FILE_ID
         and a.PACKETNUMBER = b.PACKETNUMBER
         and a.PAGE_INDEX < b.PAGE_INDEX
+    left join (
+        select o.FILE_ID, o2.PACKETNUMBER as orig_pkt, o2.MAX_PAGE as earlier_end, o3.PAGE_INDEX as later_start, COUNT(*) as intervening_count
+        from valid_deduplicated_raw o
+        join valid_deduplicated_raw o2 on o.FILE_ID = o2.FILE_ID and o.PACKETNUMBER != o2.PACKETNUMBER and o.PAGE_INDEX > o2.MAX_PAGE
+        join valid_deduplicated_raw o3 on o.FILE_ID = o3.FILE_ID and o3.PACKETNUMBER = o2.PACKETNUMBER and o3.PAGE_INDEX > o2.PAGE_INDEX and o.PAGE_INDEX < o3.PAGE_INDEX
+        group by o.FILE_ID, o2.PACKETNUMBER, o2.MAX_PAGE, o3.PAGE_INDEX
+    ) cnt on cnt.FILE_ID = a.FILE_ID and cnt.orig_pkt = a.PACKETNUMBER and cnt.earlier_end = a.MAX_PAGE and cnt.later_start = b.PAGE_INDEX
 ),
 
 rows_to_remove as (
@@ -328,12 +310,11 @@ rows_to_remove as (
 valid_deduplicated as (
     select vdr.*
     from valid_deduplicated_raw vdr
-    where NOT EXISTS (
-        select 1 from rows_to_remove r
-        where r.FILE_ID = vdr.FILE_ID
-          and r.PACKETNUMBER = vdr.PACKETNUMBER
-          and r.PAGE_INDEX = vdr.PAGE_INDEX
-    )
+    left join rows_to_remove r
+        on r.FILE_ID = vdr.FILE_ID
+        and r.PACKETNUMBER = vdr.PACKETNUMBER
+        and r.PAGE_INDEX = vdr.PAGE_INDEX
+    where r.PAGE_INDEX is null
 ),
 
 supplementary_pages as (
@@ -395,13 +376,12 @@ first_contiguous_group as (
         MIN(cg.first_page) as first_page,
         MAX(cg.last_page) as last_page_in_group
     from contiguous_groups cg
-    where NOT EXISTS (
-        select 1 from valid_deduplicated other
-        where other.FILE_ID = cg.FILE_ID
-          and other.PACKETNUMBER != cg.PACKETNUMBER
-          and other.PAGE_INDEX >= cg.first_page
-          and other.PAGE_INDEX <= cg.last_page
-    )
+    left join valid_deduplicated other
+        on other.FILE_ID = cg.FILE_ID
+        and other.PACKETNUMBER != cg.PACKETNUMBER
+        and other.PAGE_INDEX >= cg.first_page
+        and other.PAGE_INDEX <= cg.last_page
+    where other.PAGE_INDEX is null
     group by cg.PACKETNUMBER, cg.FILE_ID
 ),
 
@@ -467,10 +447,7 @@ enriched as (
 )
 
 select * from enriched e
-where not exists (
-    select 1
-    from {{ source('sharepoint','HALLNOTES_PACKETNUMBER') }} hp
-    where hp.PACKETNUMBER = e.PACKETNUMBER
-      and hp.RECEIVEDDATE = e.RECEIVEDDATE
-)
-
+left join {{ source('sharepoint','HALLNOTES_PACKETNUMBER') }} hp
+    on hp.PACKETNUMBER = e.PACKETNUMBER
+    and hp.RECEIVEDDATE = e.RECEIVEDDATE
+where hp.PACKETNUMBER is null
