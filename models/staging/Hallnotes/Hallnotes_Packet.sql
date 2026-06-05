@@ -373,7 +373,10 @@ final_pages as (
         bv.*,
         LEAST(
             COALESCE(LEAD(bv.PAGE_INDEX) OVER (PARTITION BY bv.FILE_ID ORDER BY bv.PAGE_INDEX) - 1, bv.max_page_index),
-            COALESCE(bv.last_page_in_group, bv.max_page_index)
+            COALESCE(
+                CASE WHEN bv.last_page_in_group > bv.PAGE_INDEX THEN bv.last_page_in_group ELSE NULL END,
+                COALESCE(LEAD(bv.PAGE_INDEX) OVER (PARTITION BY bv.FILE_ID ORDER BY bv.PAGE_INDEX) - 1, bv.max_page_index)
+            )
         ) as PAGE_END
     from best_valid bv
 ),
