@@ -446,7 +446,7 @@ enriched as (
         and (apk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and apk.rn = 1))
 )
 
-select * from enriched e
+select e.* from enriched e
 left join {{ source('sharepoint','HALLNOTES_PACKETNUMBER') }} hp
     on hp.PACKETNUMBER = e.PACKETNUMBER
     and hp.RECEIVEDDATE = e.RECEIVEDDATE
