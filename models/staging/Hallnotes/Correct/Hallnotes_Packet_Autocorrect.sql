@@ -43,27 +43,34 @@ forge_lookup as (
 
 -- Auto-fix 1: Unknown packets with exactly ONE fuzzy match of same length
 -- (e.g. E23208 -> E23208C when only one candidate exists after excluding file siblings)
+unknown_candidates as (
+    select
+        sp.FILE_ID, sp.PAGE_INDEX, sp.PACKETNUMBER,
+        kp2.PACKETNUMBER as candidate_pkt
+    from source_packets sp
+    left join known_packets kp_check on kp_check.PACKETNUMBER = sp.PACKETNUMBER
+    inner join known_packets kp2
+        on kp2.PACKETNUMBER LIKE LEFT(sp.PACKETNUMBER, LENGTH(sp.PACKETNUMBER) - 1) || '%'
+        and LENGTH(kp2.PACKETNUMBER) = LENGTH(sp.PACKETNUMBER) + 1
+        and kp2.PACKETNUMBER != sp.PACKETNUMBER
+    where kp_check.PACKETNUMBER is null
+      and LENGTH(sp.PACKETNUMBER) >= 5
+),
+
+unknown_single_candidates as (
+    select FILE_ID, PAGE_INDEX, PACKETNUMBER as orig_pkt, MIN(candidate_pkt) as PACKETNUMBER
+    from unknown_candidates
+    group by FILE_ID, PAGE_INDEX, PACKETNUMBER
+    having COUNT(DISTINCT candidate_pkt) = 1
+),
+
 unknown_with_single_match as (
     select
         sp.*,
-        kp_match.PACKETNUMBER as corrected_packetnumber
+        usc.PACKETNUMBER as corrected_packetnumber
     from source_packets sp
+    inner join unknown_single_candidates usc on usc.FILE_ID = sp.FILE_ID and usc.PAGE_INDEX = sp.PAGE_INDEX
     left join known_packets kp on kp.PACKETNUMBER = sp.PACKETNUMBER
-    inner join (
-        select
-            sp2.FILE_ID, sp2.PAGE_INDEX, sp2.PACKETNUMBER as orig_pkt,
-            MIN(kp2.PACKETNUMBER) as PACKETNUMBER
-        from source_packets sp2
-        left join known_packets kp_check on kp_check.PACKETNUMBER = sp2.PACKETNUMBER
-        inner join known_packets kp2
-            on kp2.PACKETNUMBER LIKE LEFT(sp2.PACKETNUMBER, LENGTH(sp2.PACKETNUMBER) - 1) || '%'
-            and LENGTH(kp2.PACKETNUMBER) = LENGTH(sp2.PACKETNUMBER) + 1
-            and kp2.PACKETNUMBER != sp2.PACKETNUMBER
-        where kp_check.PACKETNUMBER is null
-          and LENGTH(sp2.PACKETNUMBER) >= 5
-        group by sp2.FILE_ID, sp2.PAGE_INDEX, sp2.PACKETNUMBER
-        having COUNT(DISTINCT kp2.PACKETNUMBER) = 1
-    ) kp_match on kp_match.FILE_ID = sp.FILE_ID and kp_match.PAGE_INDEX = sp.PAGE_INDEX
     where kp.PACKETNUMBER is null
 ),
 
@@ -227,6 +234,127 @@ gap_fixes as (
     ) match on match.FILE_ID = g.FILE_ID and match.gap_start = g.gap_start
 ),
 
+-- Auto-fix 7: Sibling detection — when a packet exists (or was corrected by Fix 5) and Forge has
+-- siblings (same base, different suffix e.g. 416307A/416307B) for the same date that are
+-- missing from the file, AND an adjacent row has PAGE_END > PAGE_INDEX (inflated range),
+-- trim that row and insert the missing sibling into the freed page(s).
+-- Includes packets corrected by Fix 5 in the same run so both fixes can chain together.
+all_known_in_file as (
+    -- Existing known packets
+    select sp.FILE_ID, sp.PACKETNUMBER, sp.RECEIVEDDATE, sp.PAGE_INDEX, sp.PAGE_END,
+           sp.CREATED_AT, sp.MODIFIED_AT, sp._FIVETRAN_FILE_PATH, sp._FIVETRAN_SYNCED
+    from source_packets sp
+    inner join known_packets kp on kp.PACKETNUMBER = sp.PACKETNUMBER
+    union all
+    -- Packets that Fix 5 will correct in this run (e.g. S16582A -> 416307A)
+    select mf.FILE_ID, mf.corrected_packetnumber as PACKETNUMBER, mf.RECEIVEDDATE,
+           mf.PAGE_INDEX, mf.PAGE_END,
+           mf.CREATED_AT, mf.MODIFIED_AT, mf._FIVETRAN_FILE_PATH, mf._FIVETRAN_SYNCED
+    from misread_fixes mf
+),
+
+existing_with_siblings as (
+    select
+        akf.FILE_ID, akf.PACKETNUMBER, akf.RECEIVEDDATE, akf.PAGE_INDEX, akf.PAGE_END,
+        akf.CREATED_AT, akf.MODIFIED_AT, akf._FIVETRAN_FILE_PATH, akf._FIVETRAN_SYNCED,
+        LEFT(akf.PACKETNUMBER, LENGTH(akf.PACKETNUMBER) - 1) as base_pkt
+    from all_known_in_file akf
+    where REGEXP_LIKE(akf.PACKETNUMBER, '.*[A-Za-z]$')
+),
+
+missing_siblings as (
+    select
+        es.FILE_ID, es.PACKETNUMBER as existing_pkt, es.RECEIVEDDATE,
+        es.PAGE_INDEX as existing_page_index, es.PAGE_END as existing_page_end,
+        es.CREATED_AT, es.MODIFIED_AT, es._FIVETRAN_FILE_PATH, es._FIVETRAN_SYNCED,
+        fl.PACKETNUMBER as sibling_pkt,
+        fl.ACCOUNTCODE as sibling_accountcode
+    from existing_with_siblings es
+    inner join forge_lookup fl
+        on LEFT(fl.PACKETNUMBER, LENGTH(fl.PACKETNUMBER) - 1) = es.base_pkt
+        and fl.PACKETNUMBER != es.PACKETNUMBER
+        and fl.COUNTERDATE = es.RECEIVEDDATE
+        and fl.rn = 1
+    -- Sibling must not already be in the file (including Fix 5 corrections)
+    left join all_known_in_file akf_check
+        on akf_check.FILE_ID = es.FILE_ID
+        and akf_check.PACKETNUMBER = fl.PACKETNUMBER
+    where akf_check.PACKETNUMBER is null
+),
+
+-- Find adjacent rows with inflated PAGE_END that could contain the missing sibling
+sibling_with_donor as (
+    select
+        ms.*,
+        donor.PACKETNUMBER as donor_pkt,
+        donor.PAGE_INDEX as donor_page_index,
+        donor.PAGE_END as donor_page_end,
+        donor.ACCOUNTCODE as donor_accountcode,
+        donor.RECEIVEDDATE as donor_receiveddate
+    from missing_siblings ms
+    -- Look for the row immediately after or before the existing packet that spans multiple pages
+    inner join source_packets donor
+        on donor.FILE_ID = ms.FILE_ID
+        and donor.PAGE_END > donor.PAGE_INDEX
+        and donor.PACKETNUMBER != ms.existing_pkt
+        -- Donor is adjacent: either immediately before or after the existing packet
+        and (donor.PAGE_END = ms.existing_page_index - 1 OR donor.PAGE_INDEX = ms.existing_page_end + 1)
+),
+
+sibling_fixes as (
+    select
+        sd.FILE_ID,
+        sd.sibling_pkt as PACKETNUMBER,
+        sd.sibling_accountcode as ACCOUNTCODE,
+        sd.RECEIVEDDATE,
+        sd.CREATED_AT,
+        sd.MODIFIED_AT,
+        sd._FIVETRAN_FILE_PATH,
+        sd._FIVETRAN_SYNCED,
+        -- Allocate the last page of the donor to the sibling
+        CASE
+            WHEN sd.donor_page_index = sd.existing_page_end + 1
+            THEN sd.donor_page_end  -- sibling gets last page of donor after existing
+            ELSE sd.donor_page_index  -- sibling gets first page of donor before existing
+        END as PAGE_INDEX,
+        CASE
+            WHEN sd.donor_page_index = sd.existing_page_end + 1
+            THEN sd.donor_page_end
+            ELSE sd.donor_page_index
+        END as PAGE_END,
+        sd.donor_pkt as donor_packetnumber,
+        sd.donor_page_index,
+        sd.donor_page_end
+    from sibling_with_donor sd
+),
+
+-- Also emit the trimmed donor row
+sibling_donor_trims as (
+    select
+        sf.FILE_ID,
+        sf.donor_packetnumber as PACKETNUMBER,
+        sp_donor.ACCOUNTCODE,
+        sp_donor.RECEIVEDDATE,
+        sp_donor.CREATED_AT,
+        sp_donor.MODIFIED_AT,
+        sp_donor._FIVETRAN_FILE_PATH,
+        sp_donor._FIVETRAN_SYNCED,
+        sf.donor_page_index as PAGE_INDEX,
+        -- Trim the donor: remove the page allocated to the sibling
+        CASE
+            WHEN sf.donor_page_index = sf.existing_page_end + 1
+            THEN sf.donor_page_end - 1  -- trim last page
+            ELSE sf.donor_page_index + 1  -- trim first page (shift start)
+        END as PAGE_END
+    from sibling_fixes sf
+    inner join source_packets sp_donor
+        on sp_donor.FILE_ID = sf.FILE_ID
+        and sp_donor.PACKETNUMBER = sf.donor_packetnumber
+        and sp_donor.PAGE_INDEX = sf.donor_page_index
+    -- Only trim if donor still has at least 1 page left
+    where sf.donor_page_end - sf.donor_page_index >= 1
+),
+
 -- Combine all auto-corrections into final output
 all_corrections as (
     -- Fix 1: Unknown packet -> single fuzzy match
@@ -348,6 +476,46 @@ all_corrections as (
         'GAP_FILL_FIX' as correction_type,
         true as was_corrected
     from gap_fixes gf
+
+    union all
+
+    -- Fix 7a: Insert missing sibling packet
+    select
+        sf.PACKETNUMBER,
+        sf.ACCOUNTCODE,
+        sf.RECEIVEDDATE,
+        sf.FILE_ID,
+        sf.CREATED_AT,
+        sf.MODIFIED_AT,
+        sf._FIVETRAN_FILE_PATH,
+        sf._FIVETRAN_SYNCED,
+        sf.PAGE_INDEX,
+        sf.PAGE_END,
+        sf.donor_packetnumber as original_packetnumber,
+        sf.RECEIVEDDATE as original_receiveddate,
+        'SIBLING_INSERT_FIX' as correction_type,
+        true as was_corrected
+    from sibling_fixes sf
+
+    union all
+
+    -- Fix 7b: Trim donor row that gave up a page to the sibling
+    select
+        sdt.PACKETNUMBER,
+        sdt.ACCOUNTCODE,
+        sdt.RECEIVEDDATE,
+        sdt.FILE_ID,
+        sdt.CREATED_AT,
+        sdt.MODIFIED_AT,
+        sdt._FIVETRAN_FILE_PATH,
+        sdt._FIVETRAN_SYNCED,
+        sdt.PAGE_INDEX,
+        sdt.PAGE_END,
+        sdt.PACKETNUMBER as original_packetnumber,
+        sdt.RECEIVEDDATE as original_receiveddate,
+        'SIBLING_TRIM_FIX' as correction_type,
+        true as was_corrected
+    from sibling_donor_trims sdt
 )
 
 select * from all_corrections
