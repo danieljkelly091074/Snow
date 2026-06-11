@@ -6,16 +6,12 @@
     config(
         materialized='incremental',
         unique_key=['PACKETNUMBER', 'RECEIVEDDATE', 'FILE_ID'],
-        incremental_strategy='delete+insert',
-        post_hook=[
-            "DELETE FROM {{ ref('Hallnotes_Packet') }} WHERE (PACKETNUMBER, RECEIVEDDATE, FILE_ID) IN (SELECT original_packetnumber, original_receiveddate, FILE_ID FROM {{ this }} WHERE was_corrected = true)",
-            "INSERT INTO {{ ref('Hallnotes_Packet') }} (PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END) SELECT PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END FROM {{ this }} WHERE was_corrected = true"
-        ]
+        incremental_strategy='delete+insert'
     )
 }}
 
--- This model outputs the corrected rows. The post_hooks handle updating the source table.
--- If you prefer not to auto-update, remove the post_hooks and use this as a review table.
+-- This model outputs corrected rows as a review/audit table.
+-- Corrections are NOT automatically applied back to Hallnotes_Packet.
 
 with source_packets as (
     select * from {{ ref('Hallnotes_Packet') }}
