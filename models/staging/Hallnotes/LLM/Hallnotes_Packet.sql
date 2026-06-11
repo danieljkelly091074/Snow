@@ -288,11 +288,17 @@ enriched as (
         and (pk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and pk.rn = 1))
 )
 
--- Final output: exclude packets already in the legacy table
-select e.* from enriched e
-where not exists (
-    select 1
-    from {{ source('sharepoint', 'HALLNOTES_PACKETNUMBER') }} hp
-    where hp.PACKETNUMBER = e.PACKETNUMBER
-      and hp.RECEIVEDDATE = e.RECEIVEDDATE
+-- Final output: exclude packets already in the legacy table, enforce one row per page
+select PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END
+from (
+    select e.*,
+        ROW_NUMBER() OVER (PARTITION BY e.FILE_ID, e.PAGE_INDEX ORDER BY e.PACKETNUMBER) as dedup_rn
+    from enriched e
+    where not exists (
+        select 1
+        from {{ source('sharepoint', 'HALLNOTES_PACKETNUMBER') }} hp
+        where hp.PACKETNUMBER = e.PACKETNUMBER
+          and hp.RECEIVEDDATE = e.RECEIVEDDATE
+    )
 )
+where dedup_rn = 1
