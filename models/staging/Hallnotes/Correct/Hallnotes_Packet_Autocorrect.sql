@@ -396,12 +396,16 @@ sibling_donor_trims as (
         sp_donor.MODIFIED_AT,
         sp_donor._FIVETRAN_FILE_PATH,
         sp_donor._FIVETRAN_SYNCED,
-        sf.donor_page_index as PAGE_INDEX,
-        -- Trim the donor: remove the page allocated to the sibling
+        -- Trim the donor: adjust PAGE_INDEX or PAGE_END depending on which page was taken
         CASE
             WHEN sf.donor_page_index = sf.existing_page_end + 1
-            THEN sf.donor_page_end - 1  -- trim last page
-            ELSE sf.donor_page_index + 1  -- trim first page (shift start)
+            THEN sf.donor_page_index  -- donor after existing: keep start, trim end
+            ELSE sf.donor_page_index + 1  -- donor before existing: shift start forward
+        END as PAGE_INDEX,
+        CASE
+            WHEN sf.donor_page_index = sf.existing_page_end + 1
+            THEN sf.donor_page_end - 1  -- donor after existing: trim last page
+            ELSE sf.donor_page_end  -- donor before existing: keep end
         END as PAGE_END
     from sibling_fixes sf
     inner join source_packets sp_donor
