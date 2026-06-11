@@ -311,6 +311,7 @@ sibling_fixes as (
         sd.MODIFIED_AT,
         sd._FIVETRAN_FILE_PATH,
         sd._FIVETRAN_SYNCED,
+        sd.existing_page_end,
         -- Allocate the last page of the donor to the sibling
         CASE
             WHEN sd.donor_page_index = sd.existing_page_end + 1
