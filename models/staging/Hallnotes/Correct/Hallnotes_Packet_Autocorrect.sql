@@ -27,18 +27,12 @@ with source_packets as (
 
 known_packets as (
     select distinct PACKETNUMBER from {{ source('forge', 'PACKET') }}
-    union
-    select distinct PACKETNUMBER from {{ source('forge', 'ARCHIVEPACKET') }}
 ),
 
 forge_lookup as (
     select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
            ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, COUNTER::DATE ORDER BY COUNTER DESC) as rn
     from {{ source('forge', 'PACKET') }}
-    union all
-    select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
-           ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, COUNTER::DATE ORDER BY COUNTER DESC) as rn
-    from {{ source('forge', 'ARCHIVEPACKET') }}
 ),
 
 -- Auto-fix 1: Unknown packets with exactly ONE fuzzy match of same length
@@ -118,63 +112,125 @@ forge_packets_by_date as (
 ),
 
 unknown_packets as (
+    -- Packets not in Forge at all
     select sp.*
     from source_packets sp
     left join known_packets kp on kp.PACKETNUMBER = sp.PACKETNUMBER
     where kp.PACKETNUMBER is null
 ),
 
+-- Packets that exist in Forge but have NO matching record for their account+date combo
+-- These are likely misreads where the OCR coincidentally produced a real packet number
+known_but_mismatched as (
+    select sp.*
+    from source_packets sp
+    inner join known_packets kp on kp.PACKETNUMBER = sp.PACKETNUMBER
+    where sp.ACCOUNTCODE is not null
+      and not exists (
+          select 1 from forge_lookup fl
+          where fl.PACKETNUMBER = sp.PACKETNUMBER
+            and fl.COUNTERDATE = sp.RECEIVEDDATE
+            and fl.ACCOUNTCODE = sp.ACCOUNTCODE
+      )
+),
+
+-- Combine both types as candidates for Fix 5
+suspect_packets as (
+    select * from unknown_packets
+    union all
+    select * from known_but_mismatched
+),
+
 -- First try: match on RECEIVEDDATE + ACCOUNTCODE (highest confidence)
 misread_with_account as (
     select
-        up2.FILE_ID, up2.PAGE_INDEX, up2.PACKETNUMBER as orig_pkt,
+        sp2.FILE_ID, sp2.PAGE_INDEX, sp2.PACKETNUMBER as orig_pkt,
         MIN(fpd.PACKETNUMBER) as corrected_packetnumber
-    from unknown_packets up2
+    from suspect_packets sp2
     inner join forge_packets_by_date fpd
-        on fpd.COUNTERDATE = up2.RECEIVEDDATE
-        and fpd.ACCOUNTCODE = up2.ACCOUNTCODE
+        on fpd.COUNTERDATE = sp2.RECEIVEDDATE
+        and fpd.ACCOUNTCODE = sp2.ACCOUNTCODE
     -- Exclude Forge packets already present in this file
     left join source_packets sp_existing
-        on sp_existing.FILE_ID = up2.FILE_ID
+        on sp_existing.FILE_ID = sp2.FILE_ID
         and sp_existing.PACKETNUMBER = fpd.PACKETNUMBER
     where sp_existing.PACKETNUMBER is null
-      and up2.ACCOUNTCODE is not null
+      and sp2.ACCOUNTCODE is not null
       -- Exclude packets already matched by Fix 1
-      and fpd.PACKETNUMBER not in (select corrected_packetnumber from unknown_with_single_match where FILE_ID = up2.FILE_ID)
-    group by up2.FILE_ID, up2.PAGE_INDEX, up2.PACKETNUMBER
+      and fpd.PACKETNUMBER not in (select corrected_packetnumber from unknown_with_single_match where FILE_ID = sp2.FILE_ID)
+      -- Don't correct to the same packet number
+      and fpd.PACKETNUMBER != sp2.PACKETNUMBER
+    group by sp2.FILE_ID, sp2.PAGE_INDEX, sp2.PACKETNUMBER
+    having COUNT(DISTINCT fpd.PACKETNUMBER) = 1
+),
+
+-- Suffix tiebreaker: when misread_with_account found multiple candidates (blocked by HAVING = 1),
+-- but the misread packet ends in a letter suffix and exactly one candidate shares that suffix,
+-- prefer that candidate. E.g. S16582A -> 416307A (not 416307B) because both end in "A".
+misread_suffix_tiebreaker as (
+    select
+        sp2.FILE_ID, sp2.PAGE_INDEX, sp2.PACKETNUMBER as orig_pkt,
+        MIN(fpd.PACKETNUMBER) as corrected_packetnumber
+    from suspect_packets sp2
+    inner join forge_packets_by_date fpd
+        on fpd.COUNTERDATE = sp2.RECEIVEDDATE
+        and fpd.ACCOUNTCODE = sp2.ACCOUNTCODE
+    -- Exclude Forge packets already present in this file
+    left join source_packets sp_existing
+        on sp_existing.FILE_ID = sp2.FILE_ID
+        and sp_existing.PACKETNUMBER = fpd.PACKETNUMBER
+    -- Exclude those already resolved by single-candidate match
+    left join misread_with_account mwa
+        on mwa.FILE_ID = sp2.FILE_ID and mwa.PAGE_INDEX = sp2.PAGE_INDEX
+    where sp_existing.PACKETNUMBER is null
+      and sp2.ACCOUNTCODE is not null
+      and mwa.FILE_ID is null
+      and fpd.PACKETNUMBER not in (select corrected_packetnumber from unknown_with_single_match where FILE_ID = sp2.FILE_ID)
+      and fpd.PACKETNUMBER != sp2.PACKETNUMBER
+      -- Suffix match: misread packet ends in a letter, and candidate ends in the same letter
+      and REGEXP_LIKE(sp2.PACKETNUMBER, '.*[A-Za-z]$')
+      and RIGHT(fpd.PACKETNUMBER, 1) = RIGHT(sp2.PACKETNUMBER, 1)
+    group by sp2.FILE_ID, sp2.PAGE_INDEX, sp2.PACKETNUMBER
     having COUNT(DISTINCT fpd.PACKETNUMBER) = 1
 ),
 
 -- Fallback: match on RECEIVEDDATE only (when account code is null or no account match found)
 misread_date_only as (
     select
-        up2.FILE_ID, up2.PAGE_INDEX, up2.PACKETNUMBER as orig_pkt,
+        sp2.FILE_ID, sp2.PAGE_INDEX, sp2.PACKETNUMBER as orig_pkt,
         MIN(fpd.PACKETNUMBER) as corrected_packetnumber
-    from unknown_packets up2
-    inner join forge_packets_by_date fpd on fpd.COUNTERDATE = up2.RECEIVEDDATE
+    from suspect_packets sp2
+    inner join forge_packets_by_date fpd on fpd.COUNTERDATE = sp2.RECEIVEDDATE
     -- Exclude Forge packets already present in this file
     left join source_packets sp_existing
-        on sp_existing.FILE_ID = up2.FILE_ID
+        on sp_existing.FILE_ID = sp2.FILE_ID
         and sp_existing.PACKETNUMBER = fpd.PACKETNUMBER
-    -- Exclude packets already matched by account-based fix above
+    -- Exclude packets already matched by account-based fix or suffix tiebreaker
     left join misread_with_account mwa
-        on mwa.FILE_ID = up2.FILE_ID and mwa.PAGE_INDEX = up2.PAGE_INDEX
+        on mwa.FILE_ID = sp2.FILE_ID and mwa.PAGE_INDEX = sp2.PAGE_INDEX
+    left join misread_suffix_tiebreaker mst
+        on mst.FILE_ID = sp2.FILE_ID and mst.PAGE_INDEX = sp2.PAGE_INDEX
     where sp_existing.PACKETNUMBER is null
       and mwa.FILE_ID is null
+      and mst.FILE_ID is null
       -- Exclude packets already matched by Fix 1
-      and fpd.PACKETNUMBER not in (select corrected_packetnumber from unknown_with_single_match where FILE_ID = up2.FILE_ID)
-    group by up2.FILE_ID, up2.PAGE_INDEX, up2.PACKETNUMBER
+      and fpd.PACKETNUMBER not in (select corrected_packetnumber from unknown_with_single_match where FILE_ID = sp2.FILE_ID)
+      -- Don't correct to the same packet number
+      and fpd.PACKETNUMBER != sp2.PACKETNUMBER
+    group by sp2.FILE_ID, sp2.PAGE_INDEX, sp2.PACKETNUMBER
     having COUNT(DISTINCT fpd.PACKETNUMBER) = 1
 ),
 
 misread_fixes as (
-    select up.*, match.corrected_packetnumber
-    from unknown_packets up
+    select sp2.*, match.corrected_packetnumber
+    from suspect_packets sp2
     inner join (
         select FILE_ID, PAGE_INDEX, orig_pkt, corrected_packetnumber from misread_with_account
         union all
+        select FILE_ID, PAGE_INDEX, orig_pkt, corrected_packetnumber from misread_suffix_tiebreaker
+        union all
         select FILE_ID, PAGE_INDEX, orig_pkt, corrected_packetnumber from misread_date_only
-    ) match on match.FILE_ID = up.FILE_ID and match.PAGE_INDEX = up.PAGE_INDEX
+    ) match on match.FILE_ID = sp2.FILE_ID and match.PAGE_INDEX = sp2.PAGE_INDEX
 ),
 
 -- Auto-fix 6: Gap detection — when there's a missing page between rows,
