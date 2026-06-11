@@ -8,8 +8,8 @@
         unique_key=['PACKETNUMBER', 'RECEIVEDDATE', 'FILE_ID'],
         incremental_strategy='delete+insert',
         post_hook=[
-            "DELETE FROM {{ ref('hallnotes_packet') }} WHERE (PACKETNUMBER, RECEIVEDDATE, FILE_ID) IN (SELECT original_packetnumber, original_receiveddate, FILE_ID FROM {{ this }} WHERE was_corrected = true)",
-            "INSERT INTO {{ ref('hallnotes_packet') }} (PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END) SELECT PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END FROM {{ this }} WHERE was_corrected = true"
+            "DELETE FROM {{ ref('Hallnotes_Packet') }} WHERE (PACKETNUMBER, RECEIVEDDATE, FILE_ID) IN (SELECT original_packetnumber, original_receiveddate, FILE_ID FROM {{ this }} WHERE was_corrected = true)",
+            "INSERT INTO {{ ref('Hallnotes_Packet') }} (PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END) SELECT PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END FROM {{ this }} WHERE was_corrected = true"
         ]
     )
 }}
@@ -18,7 +18,7 @@
 -- If you prefer not to auto-update, remove the post_hooks and use this as a review table.
 
 with source_packets as (
-    select * from {{ ref('hallnotes_packet') }}
+    select * from {{ ref('Hallnotes_Packet') }}
     where CREATED_AT > '2026-06-10'::TIMESTAMP
     {% if is_incremental() %}
     and FILE_ID not in (select distinct FILE_ID from {{ this }})
