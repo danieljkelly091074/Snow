@@ -234,6 +234,19 @@ with_supplementary as (
     from grouped_packets gp
 ),
 
+supplementary_max as (
+    select
+        ws.FILE_ID,
+        ws.PAGE_INDEX,
+        MAX(sp.page_index) as max_supp_page
+    from with_supplementary ws
+    inner join supplementary_pages sp
+        on sp.FILE_ID = ws.FILE_ID
+        and sp.page_index > ws.PAGE_END
+        and sp.page_index < COALESCE(ws.next_packet_start, 999999)
+    group by ws.FILE_ID, ws.PAGE_INDEX
+),
+
 final_pages as (
     select
         ws.PACKETNUMBER,
@@ -245,17 +258,11 @@ final_pages as (
         ws._FIVETRAN_FILE_PATH,
         ws._FIVETRAN_SYNCED,
         ws.PAGE_INDEX,
-        -- Extend PAGE_END to include any supplementary pages before next packet
-        COALESCE(
-            (select MAX(sp.page_index)
-             from supplementary_pages sp
-             where sp.FILE_ID = ws.FILE_ID
-               and sp.page_index > ws.PAGE_END
-               and sp.page_index < COALESCE(ws.next_packet_start, sp.page_index + 999)
-            ),
-            ws.PAGE_END
-        ) as PAGE_END
+        COALESCE(sm.max_supp_page, ws.PAGE_END) as PAGE_END
     from with_supplementary ws
+    left join supplementary_max sm
+        on sm.FILE_ID = ws.FILE_ID
+        and sm.PAGE_INDEX = ws.PAGE_INDEX
 ),
 
 -- Step 13: Enrich with Forge account code (live PACKET table only)
