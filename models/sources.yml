@@ -35,6 +35,8 @@ sources:
     tables:
       - name: HALLNOTES
         description: Raw PDF documents synced from SharePoint via Fivetran
+      - name: HALLNOTES_PACKET
+        description: Parsed packet data extracted from hallnotes PDFs
       - name: HALLNOTES_PACKETNUMBER
         description: Parsed packet data extracted from hallnotes PDFs
   

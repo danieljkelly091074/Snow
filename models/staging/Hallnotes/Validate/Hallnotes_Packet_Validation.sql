@@ -11,7 +11,7 @@ with packets as (
     select *,
         LEAD(PAGE_INDEX) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) as next_page_index,
         LAG(PAGE_END) OVER (PARTITION BY FILE_ID ORDER BY PAGE_INDEX) as prev_page_end
-    from {{ ref('hallnotes_packetnumber') }}
+    from {{ ref('Hallnotes_Packet') }}
 ),
 
 known_packets as (
@@ -118,7 +118,7 @@ duplicate_packets as (
     from packets p
     inner join (
         select FILE_ID, PACKETNUMBER, COUNT(*) as pkt_count
-        from {{ ref('hallnotes_packetnumber') }}
+        from {{ ref('Hallnotes_Packet') }}
         group by FILE_ID, PACKETNUMBER
         having COUNT(*) > 1
     ) cnt on cnt.FILE_ID = p.FILE_ID and cnt.PACKETNUMBER = p.PACKETNUMBER
