@@ -98,7 +98,7 @@ date_mismatches as (
         'DATE_MISMATCH' as issue_type,
         'Received date ' || p.RECEIVEDDATE || ' has no matching counter date in Forge' as issue_description,
         'Check if date is misread - nearest Forge dates: ' || 
-            COALESCE((select LISTAGG(DISTINCT fl2.COUNTERDATE::VARCHAR, ', ') WITHIN GROUP (ORDER BY fl2.COUNTERDATE DESC)
+            COALESCE((select LISTAGG(DISTINCT fl2.COUNTERDATE::VARCHAR, ', ') WITHIN GROUP (ORDER BY fl2.COUNTERDATE::VARCHAR DESC)
              from forge_lookup fl2 where fl2.PACKETNUMBER = p.PACKETNUMBER and fl2.COUNTERDATE between p.RECEIVEDDATE - 7 and p.RECEIVEDDATE + 7), 'none found') as suggested_fix
     from packets p
     inner join known_packets kp on kp.PACKETNUMBER = p.PACKETNUMBER
@@ -118,7 +118,7 @@ duplicate_packets as (
     from packets p
     inner join (
         select FILE_ID, PACKETNUMBER, COUNT(*) as pkt_count
-        from {{ ref('Hallnotes_Packet') }}
+    from {{ ref('Hallnotes_Packet') }}
         group by FILE_ID, PACKETNUMBER
         having COUNT(*) > 1
     ) cnt on cnt.FILE_ID = p.FILE_ID and cnt.PACKETNUMBER = p.PACKETNUMBER
