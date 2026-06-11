@@ -44,7 +44,7 @@ parsed as (
     from source_file sf
 ),
 
--- Step 2: Flatten to one row per page
+-- Step 2: Flatten to one row per page (with dedup to prevent any source fan-out)
 pages as (
     select
         p.FILE_ID,
@@ -56,6 +56,7 @@ pages as (
         page.value:index::INT as page_index
     from parsed p,
     lateral flatten(input => p.doc:pages) page
+    qualify ROW_NUMBER() OVER (PARTITION BY p.FILE_ID, page.value:index::INT ORDER BY p.CREATED_AT) = 1
 ),
 
 -- Step 3: LLM extraction - one call per page
@@ -226,12 +227,19 @@ grouped_packets as (
     group by PACKETNUMBER, FILE_ID, grp
 ),
 
+-- Step 11b: Ensure one row per FILE_ID + PAGE_INDEX (final safety net before enrichment)
+deduped_packets as (
+    select *
+    from grouped_packets
+    qualify ROW_NUMBER() OVER (PARTITION BY FILE_ID, PAGE_INDEX ORDER BY PACKETNUMBER) = 1
+),
+
 -- Step 12: Extend PAGE_END to include supplementary pages
 with_supplementary as (
     select
         gp.*,
         LEAD(gp.PAGE_INDEX) OVER (PARTITION BY gp.FILE_ID ORDER BY gp.PAGE_INDEX) as next_packet_start
-    from grouped_packets gp
+    from deduped_packets gp
 ),
 
 supplementary_max as (
