@@ -229,7 +229,7 @@ valid_detections as (
             CASE WHEN kp_direct.PACKETNUMBER IS NOT NULL THEN v.PACKETNUMBER ELSE NULL END,
             CASE WHEN v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER AND kp_text.PACKETNUMBER IS NOT NULL THEN v.PACKET_TEXT ELSE NULL END,
             fm.resolved_pkt,
-            CASE WHEN sc.stripped IS NOT NULL AND sconf.PACKETNUMBER IS NULL THEN sc.stripped ELSE NULL END,
+            CASE WHEN sc.stripped IS NOT NULL AND sconf.FILE_ID IS NULL THEN sc.stripped ELSE NULL END,
             v.PACKETNUMBER
         ) as PACKETNUMBER,
         v.ACCOUNTCODE, v.RECEIVEDDATE, v.FILE_ID, v.CREATED_AT, v.MODIFIED_AT, v._FIVETRAN_FILE_PATH, v._FIVETRAN_SYNCED, v.page_index, v.max_page_index, v.is_valid, v.is_hallnote_header
@@ -242,7 +242,7 @@ valid_detections as (
     where kp_direct.PACKETNUMBER IS NOT NULL
        OR kp_text.PACKETNUMBER IS NOT NULL
        OR fm.resolved_pkt IS NOT NULL
-       OR (sc.stripped IS NOT NULL AND sconf.PACKETNUMBER IS NULL)
+       OR (sc.stripped IS NOT NULL AND sconf.FILE_ID IS NULL)
 ),
 
 valid_detections_corrected as (
@@ -467,12 +467,90 @@ enriched as (
     ) apk
         on apk.PACKETNUMBER = f.PACKETNUMBER
         and (apk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and apk.rn = 1))
+),
+
+-- Fix 6: Gap detection — when there's a missing page between rows,
+-- look for a Forge packet on the same RECEIVEDDATE not already in the file.
+-- If exactly one candidate exists, insert it into the gap.
+forge_by_date as (
+    select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
+           ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, COUNTER::DATE ORDER BY COUNTER DESC) as rn
+    from {{ source('forge', 'PACKET') }}
+    union all
+    select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
+           ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER, COUNTER::DATE ORDER BY COUNTER DESC) as rn
+    from {{ source('forge', 'ARCHIVEPACKET') }}
+),
+
+page_gaps as (
+    select
+        e.*,
+        LEAD(e.PAGE_INDEX) OVER (PARTITION BY e.FILE_ID ORDER BY e.PAGE_INDEX) as next_page_index,
+        LEAD(e.PAGE_INDEX) OVER (PARTITION BY e.FILE_ID ORDER BY e.PAGE_INDEX) - e.PAGE_END - 1 as gap_size
+    from enriched e
+),
+
+gaps_with_context as (
+    select
+        pg.FILE_ID,
+        pg.PAGE_END + 1 as gap_start,
+        pg.next_page_index - 1 as gap_end,
+        pg.RECEIVEDDATE,
+        pg.CREATED_AT,
+        pg.MODIFIED_AT,
+        pg._FIVETRAN_FILE_PATH,
+        pg._FIVETRAN_SYNCED
+    from page_gaps pg
+    where pg.gap_size > 0
+      and pg.next_page_index is not null
+),
+
+gap_fills as (
+    select
+        g.FILE_ID,
+        g.gap_start as PAGE_INDEX,
+        g.gap_end as PAGE_END,
+        g.CREATED_AT,
+        g.MODIFIED_AT,
+        g._FIVETRAN_FILE_PATH,
+        g._FIVETRAN_SYNCED,
+        match.PACKETNUMBER,
+        match.ACCOUNTCODE,
+        match.RECEIVEDDATE
+    from gaps_with_context g
+    inner join (
+        select
+            g2.FILE_ID, g2.gap_start,
+            MIN(fbd.PACKETNUMBER) as PACKETNUMBER,
+            MIN(fbd.ACCOUNTCODE) as ACCOUNTCODE,
+            fbd.COUNTERDATE as RECEIVEDDATE
+        from gaps_with_context g2
+        inner join forge_by_date fbd on fbd.COUNTERDATE = g2.RECEIVEDDATE and fbd.rn = 1
+        -- Exclude Forge packets already in this file
+        left join enriched e_existing
+            on e_existing.FILE_ID = g2.FILE_ID
+            and e_existing.PACKETNUMBER = fbd.PACKETNUMBER
+        where e_existing.PACKETNUMBER is null
+        group by g2.FILE_ID, g2.gap_start, fbd.COUNTERDATE
+        having COUNT(DISTINCT fbd.PACKETNUMBER) = 1
+    ) match on match.FILE_ID = g.FILE_ID and match.gap_start = g.gap_start
+),
+
+combined as (
+    select * from enriched
+    union all
+    select
+        PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE,
+        FILE_ID, CREATED_AT, MODIFIED_AT,
+        _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED,
+        PAGE_INDEX, PAGE_END
+    from gap_fills
 )
 
-select e.* from enriched e
+select c.* from combined c
 where not exists (
     select 1
     from {{ source('sharepoint','HALLNOTES_PACKETNUMBER') }} hp
-    where hp.PACKETNUMBER = e.PACKETNUMBER
-      and hp.RECEIVEDDATE = e.RECEIVEDDATE
+    where hp.PACKETNUMBER = c.PACKETNUMBER
+      and hp.RECEIVEDDATE = c.RECEIVEDDATE
 )
