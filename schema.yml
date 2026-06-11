@@ -1,7 +1,7 @@
 version: 2
 
 models:
-  - name: hallnotes_packet
+  - name: Hallnotes_Packet
     description: Parsed and enriched packet data extracted from hallnotes PDFs using AI_PARSE_DOCUMENT and Cortex LLM
     columns:
       - name: FILE_ID
