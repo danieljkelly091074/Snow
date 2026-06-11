@@ -111,7 +111,10 @@ all_detections_raw as (
             THEN UPPER(REPLACE(TRIM(result:packet_text::VARCHAR), ' ', ''))
             ELSE NULL
         END as PACKET_TEXT,
-        NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null') as ACCOUNTCODE,
+        COALESCE(
+            NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null'),
+            REGEXP_SUBSTR(page_content, 'Acc\\s*No[.:\\s]*(\\d{4,6})', 1, 1, 'ie', 1)
+        ) as ACCOUNTCODE,
         COALESCE(
             TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY'),
             TRY_TO_DATE(result:received_date::VARCHAR, 'YYYY-MM-DD'),
@@ -214,14 +217,14 @@ strip_candidates as (
 ),
 
 strip_conflicts as (
-    select sc.FILE_ID, sc.page_index, sc.PACKETNUMBER
+    select distinct sc.FILE_ID, sc.page_index, sc.PACKETNUMBER
     from strip_candidates sc
     inner join known_packets kp on kp.PACKETNUMBER LIKE LEFT(sc.PACKETNUMBER, LENGTH(sc.PACKETNUMBER) - 1) || '%'
         and kp.PACKETNUMBER != sc.stripped
 ),
 
 valid_detections as (
-    select
+    select distinct
         COALESCE(
             CASE WHEN kp_direct.PACKETNUMBER IS NOT NULL THEN v.PACKETNUMBER ELSE NULL END,
             CASE WHEN v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER AND kp_text.PACKETNUMBER IS NOT NULL THEN v.PACKET_TEXT ELSE NULL END,
@@ -234,8 +237,8 @@ valid_detections as (
     left join known_packets kp_direct on kp_direct.PACKETNUMBER = v.PACKETNUMBER
     left join known_packets kp_text on v.PACKET_TEXT IS NOT NULL AND v.PACKET_TEXT != v.PACKETNUMBER AND kp_text.PACKETNUMBER = v.PACKET_TEXT
     left join fuzzy_matches fm on fm.FILE_ID = v.FILE_ID and fm.page_index = v.page_index
-    left join strip_candidates sc on sc.FILE_ID = v.FILE_ID and sc.page_index = v.page_index
-    left join strip_conflicts sconf on sconf.FILE_ID = v.FILE_ID and sconf.page_index = v.page_index
+    left join (select distinct FILE_ID, page_index, stripped from strip_candidates) sc on sc.FILE_ID = v.FILE_ID and sc.page_index = v.page_index
+    left join (select distinct FILE_ID, page_index from strip_conflicts) sconf on sconf.FILE_ID = v.FILE_ID and sconf.page_index = v.page_index
     where kp_direct.PACKETNUMBER IS NOT NULL
        OR kp_text.PACKETNUMBER IS NOT NULL
        OR fm.resolved_pkt IS NOT NULL
