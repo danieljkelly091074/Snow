@@ -190,8 +190,6 @@ valid_detections_raw as (
 
 known_packets as (
     select distinct PACKETNUMBER from {{ source('forge', 'PACKET') }}
-    union
-    select distinct PACKETNUMBER from {{ source('forge', 'ARCHIVEPACKET') }}
 ),
 
 fuzzy_siblings as (
@@ -443,8 +441,8 @@ final_pages as (
 enriched as (
     select
         f.PACKETNUMBER,
-        COALESCE(pk.ACCOUNTCODE, apk.ACCOUNTCODE, f.ACCOUNTCODE) as ACCOUNTCODE,
-        COALESCE(f.RECEIVEDDATE, pk.COUNTERDATE, apk.COUNTERDATE) as RECEIVEDDATE,
+        COALESCE(pk.ACCOUNTCODE, f.ACCOUNTCODE) as ACCOUNTCODE,
+        COALESCE(f.RECEIVEDDATE, pk.COUNTERDATE) as RECEIVEDDATE,
         f.FILE_ID,
         f.CREATED_AT,
         f.MODIFIED_AT,
@@ -460,13 +458,6 @@ enriched as (
     ) pk
         on pk.PACKETNUMBER = f.PACKETNUMBER
         and (pk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and pk.rn = 1))
-    left join (
-        select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
-               ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER ORDER BY COUNTER DESC) as rn
-        from {{ source('forge', 'ARCHIVEPACKET') }}
-    ) apk
-        on apk.PACKETNUMBER = f.PACKETNUMBER
-        and (apk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and apk.rn = 1))
 )
 
 select e.* from enriched e
