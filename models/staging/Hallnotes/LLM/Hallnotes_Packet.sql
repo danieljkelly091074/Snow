@@ -39,7 +39,7 @@ parsed as (
         sf.*,
         AI_PARSE_DOCUMENT(
             TO_FILE('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES', sf._FIVETRAN_FILE_PATH),
-            {'mode': 'OCR', 'page_split': true}
+            {'mode': 'LAYOUT', 'page_split': true}
         ) as doc
     from source_file sf
 ),
