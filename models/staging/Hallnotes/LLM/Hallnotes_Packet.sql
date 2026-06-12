@@ -1,6 +1,6 @@
--- dbt model: Hallnotes_Packet_v2.sql
--- Simplified hallnotes packet extraction: OCR -> LLM -> one packet per page -> group -> enrich
--- Trusts the LLM's primary barcode_value detection. Autocorrect model handles corrections.
+-- dbt model: Hallnotes_Packet.sql
+-- Vision-based extraction: sends entire PDF to claude-sonnet-4-6 which reads barcodes visually
+-- No AI_PARSE_DOCUMENT needed - one API call per document
 
 {{
     config(
@@ -33,18 +33,56 @@ with source_file as (
     {% endif %}
 ),
 
--- Step 1: OCR the PDF with page splitting
-parsed as (
+-- Step 1: Send entire PDF to claude-sonnet-4-6 for extraction
+extracted as (
     select
         sf.*,
-        AI_PARSE_DOCUMENT(
-            TO_FILE('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES', sf._FIVETRAN_FILE_PATH),
-            {'mode': 'LAYOUT', 'page_split': true}
-        ) as doc
+        AI_COMPLETE(
+            'claude-sonnet-4-6',
+            PROMPT('This is a scanned PDF of hallnotes from a jewellery assay office. For each page, extract:
+- page_number (0-indexed)
+- packet_number: the main barcode/packet number (5-10 chars, patterns: Letter+digits+suffix like S16582A, Q5342XB, N20528; Digits+suffix like 416467, 412931C; or pure digits like 412905). Read the barcode carefully and preserve ALL characters exactly.
+- account_code: printed number after "Account No." or "Acc No:" or "Acc No." (4-6 digits only). Ignore handwritten codes. Ignore "Your Ref:" values.
+- received_date: date at the VERY TOP of the page before the barcode, often prefixed with day of week (e.g. "Thu 30-Apr-2026"). Do NOT use "Est Comp" dates. Return in DD-Mon-YYYY format.
+- is_supplementary: true if the page is a continuation/supplementary page belonging to the PREVIOUS packet. Supplementary pages include: Article Discrepancy Notes, Laser Engraving forms, Secondhand Check Sheets, invoice/delivery forms that reference the same packet as the preceding page. These do NOT start a new packet.
+
+Return as a JSON array of objects. {0}',
+                TO_FILE('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES', sf._FIVETRAN_FILE_PATH)
+            ),
+            response_format => {'type': 'json', 'schema': {
+                'type': 'object',
+                'properties': {
+                    'pages': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'page_number': {'type': 'integer'},
+                                'packet_number': {'type': 'string'},
+                                'account_code': {'type': 'string'},
+                                'received_date': {'type': 'string'},
+                                'is_supplementary': {'type': 'boolean'}
+                            }
+                        }
+                    }
+                }
+            }}
+        ) as llm_response
     from source_file sf
 ),
 
--- Step 2: Flatten to one row per page (with dedup to prevent any source fan-out)
+-- Step 2: Parse response and flatten to one row per page
+parsed as (
+    select
+        e.FILE_ID,
+        e.CREATED_AT,
+        e.MODIFIED_AT,
+        e._FIVETRAN_FILE_PATH,
+        e._FIVETRAN_SYNCED,
+        TRY_PARSE_JSON(e.llm_response) as response
+    from extracted e
+),
+
 pages as (
     select
         p.FILE_ID,
@@ -52,65 +90,16 @@ pages as (
         p.MODIFIED_AT,
         p._FIVETRAN_FILE_PATH,
         p._FIVETRAN_SYNCED,
-        page.value:content::VARCHAR as page_content,
-        page.value:index::INT as page_index
+        page.value:page_number::INT as page_index,
+        UPPER(TRIM(page.value:packet_number::VARCHAR)) as raw_packetnumber,
+        NULLIF(TRIM(page.value:account_code::VARCHAR), 'null') as raw_accountcode,
+        page.value:received_date::VARCHAR as raw_date,
+        COALESCE(page.value:is_supplementary::BOOLEAN, false) as is_supplementary
     from parsed p,
-    lateral flatten(input => p.doc:pages) page
-    qualify ROW_NUMBER() OVER (PARTITION BY p.FILE_ID, page.value:index::INT ORDER BY p.CREATED_AT) = 1
+    lateral flatten(input => p.response:pages) page
 ),
 
--- Step 3: LLM extraction - one call per page
-extracted as (
-    select
-        pg.*,
-        AI_COMPLETE(
-            'snowflake-llama-3.3-70b',
-            CONCAT(
-                'Extract the following fields from this document text. If a field is not found, use null.\n\n',
-                'Rules:\n',
-                '- barcode_value: The MAIN packet/barcode number printed prominently near the top. ',
-                'Patterns: Letter(s)+digits+optional suffix (S16582A, N20528, Q53047A), ',
-                'Digits+suffix (405599B, 412931C), or pure digits (412905). 5-10 chars total. ',
-                'Preserve FULL value exactly as printed. Do NOT use "Reg No". ',
-                'Ignore hallmark marks like "A+B". ',
-                'If page has "Article Discrepancy Note" it belongs to the PREVIOUS packet - return null.\n',
-                '- account_code: PRINTED number after "Account No." or "Acc No." or "Acc No:". ',
-                '4-6 digits only. Ignore handwritten codes. Ignore "Your Ref:" values.\n',
-                '- received_date: Date at the VERY TOP of page, before the barcode. ',
-                'Often prefixed with day of week (e.g. "Thu 30-Apr-2026"). ',
-                'Do NOT use "Est Comp" dates. Return in DD-Mon-YYYY format.\n\n',
-                'Document text:\n',
-                pg.page_content
-            ),
-            response_format => {'type': 'json', 'schema': {
-                'type': 'object',
-                'properties': {
-                    'barcode_value': {'type': 'string'},
-                    'account_code': {'type': 'string'},
-                    'received_date': {'type': 'string'}
-                }
-            }}
-        ) as llm_response
-    from pages pg
-    where pg.page_content is not null
-      and LENGTH(pg.page_content) > 50
-),
-
--- Step 4: Parse LLM response into structured fields
-cleaned as (
-    select
-        e.FILE_ID,
-        e.CREATED_AT,
-        e.MODIFIED_AT,
-        e._FIVETRAN_FILE_PATH,
-        e._FIVETRAN_SYNCED,
-        e.page_index,
-        e.page_content,
-        TRY_PARSE_JSON(e.llm_response) as result
-    from extracted e
-),
-
--- Step 5: One detection per page - trust the LLM's barcode_value
+-- Step 3: Clean and validate detections
 detections as (
     select
         FILE_ID,
@@ -119,161 +108,105 @@ detections as (
         _FIVETRAN_FILE_PATH,
         _FIVETRAN_SYNCED,
         page_index,
-        -- Clean the packet number
-        UPPER(REPLACE(TRIM(result:barcode_value::VARCHAR), ' ', '')) as raw_packetnumber,
-        -- Account code: LLM first, regex fallback
-        COALESCE(
-            NULLIF(REPLACE(result:account_code::VARCHAR, ' ', ''), 'null'),
-            REGEXP_SUBSTR(page_content, 'Acc\\s*No[.:\\s]*(\\d{4,6})', 1, 1, 'ie', 1)
-        ) as ACCOUNTCODE,
-        -- Received date with multiple format attempts
-        COALESCE(
-            TRY_TO_DATE(result:received_date::VARCHAR, 'DD-Mon-YYYY'),
-            TRY_TO_DATE(result:received_date::VARCHAR, 'YYYY-MM-DD'),
-            TRY_TO_DATE(result:received_date::VARCHAR, 'DD/MM/YYYY'),
-            TRY_TO_DATE(result:received_date::VARCHAR, 'DD-MM-YYYY')
-        ) as RECEIVEDDATE,
-        -- Flag supplementary pages
-        CONTAINS(UPPER(page_content), 'ARTICLE DISCREPANCY NOTE') as is_supplementary
-    from cleaned
-    where result:barcode_value::VARCHAR is not null
-      and result:barcode_value::VARCHAR != 'null'
-),
-
--- Step 6: Validate and normalize packet numbers
-valid_detections as (
-    select
-        FILE_ID,
-        CREATED_AT,
-        MODIFIED_AT,
-        _FIVETRAN_FILE_PATH,
-        _FIVETRAN_SYNCED,
-        page_index,
-        -- Extract valid packet number pattern from raw value
+        -- Normalize packet number
         COALESCE(
             REGEXP_SUBSTR(raw_packetnumber, '^[A-Z]?[0-9]{4,}[A-Z]{0,2}$'),
-            REGEXP_SUBSTR(raw_packetnumber, '[0-9]{4,}[A-Z]{0,2}')
+            REGEXP_SUBSTR(raw_packetnumber, '[A-Z]?[0-9]{4,}[A-Z]{0,2}')
         ) as PACKETNUMBER,
-        ACCOUNTCODE,
-        RECEIVEDDATE,
+        -- Validate account code (4-6 digits only)
+        CASE
+            WHEN REGEXP_LIKE(raw_accountcode, '^[0-9]{4,6}$') THEN raw_accountcode
+            ELSE NULL
+        END as ACCOUNTCODE,
+        -- Parse received date
+        COALESCE(
+            TRY_TO_DATE(raw_date, 'DD-Mon-YYYY'),
+            TRY_TO_DATE(raw_date, 'YYYY-MM-DD'),
+            TRY_TO_DATE(raw_date, 'DD/MM/YYYY')
+        ) as RECEIVEDDATE,
         is_supplementary
-    from detections
-    where NOT is_supplementary
+    from pages
+    where raw_packetnumber is not null
+      and raw_packetnumber != 'null'
       and LENGTH(raw_packetnumber) between 5 and 10
 ),
 
--- Step 7: Remove pages with no valid detection
-pages_with_packets as (
+-- Step 4: Keep only non-supplementary pages with valid packets
+valid_packets as (
     select *
-    from valid_detections
-    where PACKETNUMBER is not null
+    from detections
+    where NOT is_supplementary
+      and PACKETNUMBER is not null
       and REGEXP_LIKE(PACKETNUMBER, '^[A-Z]?[0-9]+[A-Z]{0,2}$')
       and LENGTH(PACKETNUMBER) between 5 and 10
+    qualify ROW_NUMBER() OVER (PARTITION BY FILE_ID, page_index ORDER BY PACKETNUMBER) = 1
 ),
 
--- Step 8: Assign supplementary pages to preceding packet
-supplementary_pages as (
+-- Step 5: Determine page ranges using supplementary page assignments
+-- Each packet's PAGE_END extends to include its supplementary pages
+supplementary as (
     select
-        c.FILE_ID,
-        c.page_index
-    from cleaned c
-    where CONTAINS(UPPER(c.page_content), 'ARTICLE DISCREPANCY NOTE')
-),
-
--- Step 9: Determine page ranges
--- Each packet gets PAGE_INDEX = its first page, PAGE_END = last page before next packet starts
--- Supplementary pages extend the preceding packet's range
-all_pages_ordered as (
-    select
-        p.FILE_ID,
-        p.page_index,
-        p.PACKETNUMBER,
-        p.ACCOUNTCODE,
-        p.RECEIVEDDATE,
-        p.CREATED_AT,
-        p.MODIFIED_AT,
-        p._FIVETRAN_FILE_PATH,
-        p._FIVETRAN_SYNCED,
-        LAG(p.PACKETNUMBER) OVER (PARTITION BY p.FILE_ID ORDER BY p.page_index) as prev_packet,
-        LAG(p.page_index) OVER (PARTITION BY p.FILE_ID ORDER BY p.page_index) as prev_page
-    from pages_with_packets p
-),
-
--- Step 10: Group consecutive pages with the same packet number
-packet_groups as (
-    select
-        *,
-        SUM(CASE
-            WHEN PACKETNUMBER = prev_packet AND page_index = prev_page + 1
-            THEN 0 ELSE 1
-        END) OVER (PARTITION BY FILE_ID ORDER BY page_index ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as grp
-    from all_pages_ordered
-),
-
--- Step 11: Collapse groups into one row per packet occurrence
-grouped_packets as (
-    select
-        PACKETNUMBER,
-        MAX_BY(ACCOUNTCODE, CASE WHEN ACCOUNTCODE IS NOT NULL THEN 1 ELSE 0 END) as ACCOUNTCODE,
-        MAX_BY(RECEIVEDDATE, CASE WHEN RECEIVEDDATE IS NOT NULL THEN 1 ELSE 0 END) as RECEIVEDDATE,
         FILE_ID,
-        MIN(CREATED_AT) as CREATED_AT,
-        MIN(MODIFIED_AT) as MODIFIED_AT,
-        MIN(_FIVETRAN_FILE_PATH) as _FIVETRAN_FILE_PATH,
-        MIN(_FIVETRAN_SYNCED) as _FIVETRAN_SYNCED,
-        MIN(page_index) as PAGE_INDEX,
-        MAX(page_index) as PAGE_END
-    from packet_groups
-    group by PACKETNUMBER, FILE_ID, grp
+        page_index,
+        PACKETNUMBER
+    from detections
+    where is_supplementary
+      and PACKETNUMBER is not null
 ),
 
--- Step 11b: Ensure one row per FILE_ID + PAGE_INDEX (final safety net before enrichment)
-deduped_packets as (
-    select *
-    from grouped_packets
-    qualify ROW_NUMBER() OVER (PARTITION BY FILE_ID, PAGE_INDEX ORDER BY PACKETNUMBER) = 1
-),
-
--- Step 12: Extend PAGE_END to include supplementary pages
-with_supplementary as (
+packet_page_ranges as (
     select
-        gp.*,
-        LEAD(gp.PAGE_INDEX) OVER (PARTITION BY gp.FILE_ID ORDER BY gp.PAGE_INDEX) as next_packet_start
-    from deduped_packets gp
+        vp.FILE_ID,
+        vp.PACKETNUMBER,
+        vp.ACCOUNTCODE,
+        vp.RECEIVEDDATE,
+        vp.CREATED_AT,
+        vp.MODIFIED_AT,
+        vp._FIVETRAN_FILE_PATH,
+        vp._FIVETRAN_SYNCED,
+        vp.page_index as PAGE_INDEX,
+        LEAD(vp.page_index) OVER (PARTITION BY vp.FILE_ID ORDER BY vp.page_index) as next_packet_start
+    from valid_packets vp
 ),
 
+-- Step 6: Calculate PAGE_END including supplementary pages
 supplementary_max as (
     select
-        ws.FILE_ID,
-        ws.PAGE_INDEX,
-        MAX(sp.page_index) as max_supp_page
-    from with_supplementary ws
-    inner join supplementary_pages sp
-        on sp.FILE_ID = ws.FILE_ID
-        and sp.page_index > ws.PAGE_END
-        and sp.page_index < COALESCE(ws.next_packet_start, 999999)
-    group by ws.FILE_ID, ws.PAGE_INDEX
+        ppr.FILE_ID,
+        ppr.PAGE_INDEX,
+        MAX(s.page_index) as max_supp_page
+    from packet_page_ranges ppr
+    inner join supplementary s
+        on s.FILE_ID = ppr.FILE_ID
+        and s.PACKETNUMBER = ppr.PACKETNUMBER
+        and s.page_index > ppr.PAGE_INDEX
+        and s.page_index < COALESCE(ppr.next_packet_start, 999999)
+    group by ppr.FILE_ID, ppr.PAGE_INDEX
 ),
 
 final_pages as (
     select
-        ws.PACKETNUMBER,
-        ws.ACCOUNTCODE,
-        ws.RECEIVEDDATE,
-        ws.FILE_ID,
-        ws.CREATED_AT,
-        ws.MODIFIED_AT,
-        ws._FIVETRAN_FILE_PATH,
-        ws._FIVETRAN_SYNCED,
-        ws.PAGE_INDEX,
-        COALESCE(sm.max_supp_page, ws.PAGE_END) as PAGE_END
-    from with_supplementary ws
+        ppr.PACKETNUMBER,
+        ppr.ACCOUNTCODE,
+        ppr.RECEIVEDDATE,
+        ppr.FILE_ID,
+        ppr.CREATED_AT,
+        ppr.MODIFIED_AT,
+        ppr._FIVETRAN_FILE_PATH,
+        ppr._FIVETRAN_SYNCED,
+        ppr.PAGE_INDEX,
+        COALESCE(
+            sm.max_supp_page,
+            ppr.next_packet_start - 1,
+            ppr.PAGE_INDEX
+        ) as PAGE_END
+    from packet_page_ranges ppr
     left join supplementary_max sm
-        on sm.FILE_ID = ws.FILE_ID
-        and sm.PAGE_INDEX = ws.PAGE_INDEX
+        on sm.FILE_ID = ppr.FILE_ID
+        and sm.PAGE_INDEX = ppr.PAGE_INDEX
 ),
 
--- Step 13: Enrich with Forge account code (live PACKET table only)
+-- Step 7: Enrich with Forge account code (live PACKET table only)
 enriched as (
     select
         f.PACKETNUMBER,
@@ -296,7 +229,7 @@ enriched as (
         and (pk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and pk.rn = 1))
 )
 
--- Final output: exclude packets already in the legacy table, enforce one row per page
+-- Final output: exclude packets already in the legacy table
 select PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END
 from (
     select e.*,
