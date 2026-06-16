@@ -1,6 +1,6 @@
--- dbt model: Hallnotes_Packet.sql
--- Vision-based extraction: sends entire PDF to claude-sonnet-4-6 which reads barcodes visually
--- No AI_PARSE_DOCUMENT needed - one API call per document
+-- Vision-based hallnotes packet extraction using claude-sonnet-4-6 on PDF directly
+-- Co-authored with CoCo
+-- One API call per document. Files over 10MB are skipped (rescan in smaller batches).
 
 {{
     config(
@@ -16,14 +16,13 @@ with source_file as (
         h.CREATED_AT,
         h.MODIFIED_AT,
         h._FIVETRAN_FILE_PATH,
-        h._FIVETRAN_SYNCED
+        h._FIVETRAN_SYNCED,
+        d.SIZE as file_size
     from {{ source('sharepoint', 'HALLNOTES') }} h
+    inner join directory('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES') d
+        on d.RELATIVE_PATH = h._FIVETRAN_FILE_PATH
     where h._FIVETRAN_FILE_PATH like 'root/%'
-      and exists (
-          select 1
-          from directory('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES') d
-          where d.RELATIVE_PATH = h._FIVETRAN_FILE_PATH
-      )
+      and d.SIZE < 10000000  -- Skip files over 10MB (max ~50 pages at 200 DPI grayscale)
     {% if is_incremental() %}
       and not exists (
           select 1
@@ -81,6 +80,8 @@ parsed as (
         e._FIVETRAN_SYNCED,
         TRY_PARSE_JSON(e.llm_response) as response
     from extracted e
+    where e.llm_response is not null
+      and TRY_PARSE_JSON(e.llm_response) is not null
 ),
 
 pages as (
@@ -143,7 +144,6 @@ valid_packets as (
 ),
 
 -- Step 5: Determine page ranges using supplementary page assignments
--- Each packet's PAGE_END extends to include its supplementary pages
 supplementary as (
     select
         FILE_ID,
@@ -229,7 +229,7 @@ enriched as (
         and (pk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and pk.rn = 1))
 )
 
--- Final output: exclude packets already in the legacy table
+-- Final output: dedup and exclude legacy packets
 select PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE, FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED, PAGE_INDEX, PAGE_END
 from (
     select e.*,
