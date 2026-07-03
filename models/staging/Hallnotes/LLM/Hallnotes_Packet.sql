@@ -1,5 +1,4 @@
 -- Vision-based hallnotes packet extraction using claude-sonnet-4-6 on PDF directly
--- Vision-based hallnotes packet extraction using claude-sonnet-4-6 on PDF directly
 -- Co-authored with CoCo
 -- One API call per document. Files over 10MB are skipped (rescan in smaller batches).
 
@@ -44,7 +43,7 @@ extracted as (
 - packet_number: the main barcode/packet number (5-10 chars, patterns: Letter+digits+suffix like S16582A, Q5342XB, N20528; Digits+suffix like 416467, 412931C; or pure digits like 412905). Read the barcode carefully and preserve ALL characters exactly.
 - account_code: printed number after "Account No." or "Acc No:" or "Acc No." or "Account:" (4-6 digits only). Ignore handwritten codes. Ignore "Your Ref:" values.
 - received_date: date at the VERY TOP of the page before the barcode, often prefixed with day of week (e.g. "Thu 30-Apr-2026"). Do NOT use "Est Comp" dates. Return in DD-Mon-YYYY format.
-- is_supplementary: true if the page is a continuation/supplementary page belonging to the PREVIOUS packet. Supplementary pages include: Article Discrepancy Notes, Laser Engraving forms, Secondhand Check Sheets, invoice/delivery forms that reference the same packet as the preceding page. These do NOT start a new packet.
+- is_supplementary: true if the page is a continuation/supplementary page belonging to the PREVIOUS packet. Supplementary pages include: Article Discrepancy Notes, Laser Engraving forms, Secondhand Check Sheets, invoice/delivery forms that reference the same packet as the preceding page. These do NOT start a new packet. IMPORTANT: Split packets (e.g. Z90547A and Z90547B, indicated by "Splits (2)" on the form) are NOT supplementary — each split is a separate independent packet with its own unique barcode and must be marked is_supplementary: false.
 
 Return as a JSON array of objects. {0}',
                 TO_FILE('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES', sf._FIVETRAN_FILE_PATH)
