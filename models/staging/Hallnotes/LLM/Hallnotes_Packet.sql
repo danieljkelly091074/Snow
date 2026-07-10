@@ -206,12 +206,12 @@ final_pages as (
         and sm.PAGE_INDEX = ppr.PAGE_INDEX
 ),
 
--- Step 7: Enrich with Forge account code (live PACKET table only)
+-- Step 7: Enrich with Forge account code (PACKET then ARCHIVEPACKET fallback)
 enriched as (
     select
         f.PACKETNUMBER,
-        COALESCE(pk.ACCOUNTCODE, f.ACCOUNTCODE) as ACCOUNTCODE,
-        COALESCE(f.RECEIVEDDATE, pk.COUNTERDATE) as RECEIVEDDATE,
+        COALESCE(pk.ACCOUNTCODE, apk.ACCOUNTCODE, f.ACCOUNTCODE) as ACCOUNTCODE,
+        COALESCE(f.RECEIVEDDATE, pk.COUNTERDATE, apk.COUNTERDATE) as RECEIVEDDATE,
         f.FILE_ID,
         f.CREATED_AT,
         f.MODIFIED_AT,
@@ -227,6 +227,14 @@ enriched as (
     ) pk
         on pk.PACKETNUMBER = f.PACKETNUMBER
         and (pk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and pk.rn = 1))
+    left join (
+        select PACKETNUMBER, TRADESMANACCOUNTCODE as ACCOUNTCODE, COUNTER::DATE as COUNTERDATE,
+               ROW_NUMBER() OVER (PARTITION BY PACKETNUMBER ORDER BY COUNTER DESC) as rn
+        from {{ source('forge', 'ARCHIVEPACKET') }}
+    ) apk
+        on apk.PACKETNUMBER = f.PACKETNUMBER
+        and (apk.COUNTERDATE = f.RECEIVEDDATE or (f.RECEIVEDDATE is null and apk.rn = 1))
+        and pk.PACKETNUMBER is null  -- Only use archive when not found in live PACKET
 )
 
 -- Final output: dedup and exclude legacy packets
