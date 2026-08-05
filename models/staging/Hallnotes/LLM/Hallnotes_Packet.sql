@@ -132,10 +132,37 @@ detections as (
       and LENGTH(raw_packetnumber) between 5 and 10
 ),
 
+-- Step 3b: Override supplementary flag for split packets
+-- Rule 1: If consecutive pages share the same base number but have different suffixes,
+-- they are independent split packets (not supplementary). Genuine supplementary
+-- pages always repeat the exact same full packet number.
+-- Rule 2: If a suffixed packet is marked supplementary but the previous page has a
+-- different base number, it cannot be supplementary (it's the first split in a group).
+detections_corrected as (
+    select
+        FILE_ID, CREATED_AT, MODIFIED_AT, _FIVETRAN_FILE_PATH, _FIVETRAN_SYNCED,
+        page_index, PACKETNUMBER, ACCOUNTCODE, RECEIVEDDATE,
+        CASE
+            WHEN is_supplementary
+             AND REGEXP_LIKE(PACKETNUMBER, '^.+[A-Z]$')
+             AND REGEXP_REPLACE(PACKETNUMBER, '[A-Z]$', '') =
+                 REGEXP_REPLACE(LAG(PACKETNUMBER) OVER (PARTITION BY FILE_ID ORDER BY page_index), '[A-Z]$', '')
+             AND PACKETNUMBER != LAG(PACKETNUMBER) OVER (PARTITION BY FILE_ID ORDER BY page_index)
+            THEN false  -- different suffix = split packet, not supplementary
+            WHEN is_supplementary
+             AND REGEXP_LIKE(PACKETNUMBER, '^.+[A-Z]$')
+             AND REGEXP_REPLACE(PACKETNUMBER, '[A-Z]$', '') !=
+                 COALESCE(REGEXP_REPLACE(LAG(PACKETNUMBER) OVER (PARTITION BY FILE_ID ORDER BY page_index), '[A-Z]$', ''), '')
+            THEN false  -- first split in a group with no matching predecessor
+            ELSE is_supplementary
+        END as is_supplementary
+    from detections
+),
+
 -- Step 4: Keep only non-supplementary pages with valid packets
 valid_packets as (
     select *
-    from detections
+    from detections_corrected
     where NOT is_supplementary
       and PACKETNUMBER is not null
       and REGEXP_LIKE(PACKETNUMBER, '^[A-Z]?[0-9]+[A-Z]{0,2}$')
@@ -149,7 +176,7 @@ supplementary as (
         FILE_ID,
         page_index,
         PACKETNUMBER
-    from detections
+    from detections_corrected
     where is_supplementary
       and PACKETNUMBER is not null
 ),
