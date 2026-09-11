@@ -40,7 +40,7 @@ extracted as (
             'claude-sonnet-4-6',
             PROMPT('This is a scanned PDF of hallnotes from a jewellery assay office. For each page, extract:
 - page_number (0-indexed)
-- packet_number: the main barcode/packet number (5-10 chars, patterns: Letter+digits+suffix like S16582A, Q5342XB, N20528; Digits+suffix like 416467, 412931C; or pure digits like 412905). Read the barcode carefully and preserve ALL characters exactly.
+- packet_number: the main barcode/packet number (5-10 chars, patterns: Letter+digits+suffix like S16582A, Q5342XB, N20528; Digits+suffix like 416467, 412931C; or pure digits like 412905). Read ONLY the printed alphanumeric text — do NOT interpret barcode bars/lines as digits. If the label is vertical or rotated, read only the human-readable text, not the barcode itself.
 - account_code: printed number after "Account No." or "Acc No:" or "Acc No." or "Account:" (4-6 digits only). Ignore handwritten codes. Ignore "Your Ref:" values.
 - received_date: date at the VERY TOP of the page before the barcode, often prefixed with day of week (e.g. "Thu 30-Apr-2026"). Do NOT use "Est Comp" dates. Return in DD-Mon-YYYY format.
 - is_supplementary: true if the page is a continuation/supplementary page belonging to the PREVIOUS packet. Supplementary pages include: Article Discrepancy Notes, Laser Engraving forms, Secondhand Check Sheets, invoice/delivery forms that reference the same packet as the preceding page. These do NOT start a new packet. IMPORTANT: Split packets (e.g. Z90547A and Z90547B, indicated by "Splits (2)" on the form) are NOT supplementary — each split is a separate independent packet with its own unique barcode and must be marked is_supplementary: false.
@@ -110,9 +110,20 @@ detections as (
         _FIVETRAN_SYNCED,
         page_index,
         -- Normalize packet number
+        -- Fix: vertical barcode misreads inject a spurious digit after Z prefix (e.g. Z294747 → Z94747)
         COALESCE(
-            REGEXP_SUBSTR(raw_packetnumber, '^[A-Z]?[0-9]{4,}[A-Z]{0,2}$'),
-            REGEXP_SUBSTR(raw_packetnumber, '[A-Z]?[0-9]{4,}[A-Z]{0,2}')
+            REGEXP_SUBSTR(
+                CASE WHEN raw_packetnumber LIKE 'Z2%' AND LENGTH(raw_packetnumber) >= 7
+                     THEN 'Z' || SUBSTR(raw_packetnumber, 3)
+                     ELSE raw_packetnumber
+                END,
+                '^[A-Z]?[0-9]{4,}[A-Z]{0,2}$'),
+            REGEXP_SUBSTR(
+                CASE WHEN raw_packetnumber LIKE 'Z2%' AND LENGTH(raw_packetnumber) >= 7
+                     THEN 'Z' || SUBSTR(raw_packetnumber, 3)
+                     ELSE raw_packetnumber
+                END,
+                '[A-Z]?[0-9]{4,}[A-Z]{0,2}')
         ) as PACKETNUMBER,
         -- Validate account code (4-6 digits only)
         CASE
