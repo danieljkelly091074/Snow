@@ -30,11 +30,6 @@ with source_file as (
           from {{ this }} p
           where p.FILE_ID = h.FILE_ID
       )
-      and not exists (
-          select 1
-          from {{ ref('hallnotes_extraction_failures') }} ef
-          where ef.FILE_ID = h.FILE_ID
-      )
     {% endif %}
 ),
 
