@@ -22,12 +22,18 @@ with source_file as (
     inner join directory('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES') d
         on d.RELATIVE_PATH = h._FIVETRAN_FILE_PATH
     where h._FIVETRAN_FILE_PATH like 'root/%'
-      and d.SIZE < 10000000  -- Skip files over 10MB (max ~50 pages at 200 DPI grayscale)
+      and h._FIVETRAN_FILE_PATH not like '%/Test/%'  -- Exclude test/dev scans
+      and d.SIZE between 10000 and 10000000  -- Skip empty (<10KB) and oversized (>10MB) files
     {% if is_incremental() %}
       and not exists (
           select 1
           from {{ this }} p
           where p.FILE_ID = h.FILE_ID
+      )
+      and not exists (
+          select 1
+          from {{ ref('hallnotes_extraction_failures') }} ef
+          where ef.FILE_ID = h.FILE_ID
       )
     {% endif %}
 ),
@@ -37,8 +43,8 @@ extracted as (
     select
         sf.*,
         AI_COMPLETE(
-            'claude-sonnet-4-6',
-            PROMPT('This is a scanned PDF of hallnotes from a jewellery assay office. For each page, extract:
+            model => 'claude-sonnet-4-6',
+            prompt => PROMPT('This is a scanned PDF of hallnotes from a jewellery assay office. For each page, extract:
 - page_number (0-indexed)
 - packet_number: the main barcode/packet number (5-10 chars, patterns: Letter+digits+suffix like S16582A, Q5342XB, N20528; Digits+suffix like 416467, 412931C; or pure digits like 412905). Read ONLY the printed alphanumeric text — do NOT interpret barcode bars/lines as digits. If the label is vertical or rotated, read only the human-readable text, not the barcode itself.
 - account_code: printed number after "Account No." or "Acc No:" or "Acc No." or "Account:" (4-6 digits only). Ignore handwritten codes. Ignore "Your Ref:" values.
@@ -48,6 +54,8 @@ extracted as (
 Return as a JSON array of objects. {0}',
                 TO_FILE('@RAW__SHAREPOINT.SHAREPOINT.HALLNOTES', sf._FIVETRAN_FILE_PATH)
             ),
+            -- Default 4096 output tokens truncates files over ~63 pages to an empty {} response
+            model_parameters => {'max_tokens': 16000},
             response_format => {'type': 'json', 'schema': {
                 'type': 'object',
                 'properties': {
