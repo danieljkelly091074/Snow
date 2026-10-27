@@ -1,13 +1,38 @@
-{{ config(materialized='table')}}
+{{ config(materialized="table") }}
 
-WITH DateIncome As (
-SELECT DISTINCT TO_CHAR(dbo.Packet.Opened, 'YYYYMMDD')::INT AS DATEKEY, TO_DATE(TO_VARCHAR(dbo.Packet.Opened, 'DD/MM/YYYY'),'DD/MM/YYYY') As OpenedDate, DATE_PART(Day, dbo.Packet.Opened) AS Day, DATE_PART(Month, dbo.Packet.Opened) AS Month, DATE_PART(Year, dbo.Packet.Opened) AS Year, DATE_PART(Quarter, dbo.Packet.Opened) AS Quarter, MonthName(TO_DATE(dbo.Packet.Opened)) AS MonthName, DAYNAME(TO_DATE(dbo.Packet.Opened)) AS DayName
-FROM {{ source('DBT_SNOWFLAKE', 'PACKET') }}
-WHERE       dbo.Packet.Opened>= '01-01-2015 00:00:00' AND dbo.Packet.Opened IS NOT NULL
-UNION
-SELECT DISTINCT TO_CHAR(dbo.ArchivePacket.Opened, 'YYYYMMDD')::INT AS DATEKEY, TO_DATE(TO_VARCHAR(dbo.ArchivePacket.Opened, 'DD/MM/YYYY'),'DD/MM/YYYY') As OpenedDate, DATE_PART(Day, dbo.ArchivePacket.Opened) AS Day, DATE_PART(Month, dbo.ArchivePacket.Opened) AS Month, DATE_PART(Year, dbo.ArchivePacket.Opened) AS Year, DATE_PART(Quarter, dbo.ArchivePacket.Opened) AS Quarter, MonthName(TO_DATE(dbo.ArchivePacket.Opened)) AS MonthName, DAYNAME(TO_DATE(dbo.ArchivePacket.Opened)) AS DayName
-FROM {{ source('DBT_SNOWFLAKE', 'ARCHIVEPACKET') }}
-WHERE       dbo.ArchivePacket.Opened>= '01-01-2015 00:00:00' and dbo.ArchivePacket.Opened IS NOT NULL
-)
+with
+    dateincome as (
+        select distinct
+            to_char(dbo.packet.opened, 'YYYYMMDD')::int as datekey,
+            to_date(
+                to_varchar(dbo.packet.opened, 'DD/MM/YYYY'), 'DD/MM/YYYY'
+            ) as openeddate,
+            date_part(day, dbo.packet.opened) as day,
+            date_part(month, dbo.packet.opened) as month,
+            date_part(year, dbo.packet.opened) as year,
+            date_part(quarter, dbo.packet.opened) as quarter,
+            monthname(to_date(dbo.packet.opened)) as monthname,
+            dayname(to_date(dbo.packet.opened)) as dayname
+        from {{ source("DBT_SNOWFLAKE", "PACKET") }}
+        where
+            dbo.PACKET.COUNTER >= TO_TIMESTAMP('01-01-2015 00:00:00', 'DD-MM-YYYY HH24:MI:SS') and dbo.PACKET.COUNTER is not null
+        union
+        select distinct
+            to_char(dbo.archivepacket.opened, 'YYYYMMDD')::int as datekey,
+            to_date(
+                to_varchar(dbo.archivepacket.opened, 'DD/MM/YYYY'), 'DD/MM/YYYY'
+            ) as openeddate,
+            date_part(day, dbo.archivepacket.opened) as day,
+            date_part(month, dbo.archivepacket.opened) as month,
+            date_part(year, dbo.archivepacket.opened) as year,
+            date_part(quarter, dbo.archivepacket.opened) as quarter,
+            monthname(to_date(dbo.archivepacket.opened)) as monthname,
+            dayname(to_date(dbo.archivepacket.opened)) as dayname
+        from {{ source("DBT_SNOWFLAKE", "ARCHIVEPACKET") }}
+        where
+            dbo.ARCHIVEPACKET.COUNTER  >= TO_TIMESTAMP('01-01-2015 00:00:00', 'DD-MM-YYYY HH24:MI:SS')
+            and dbo.ARCHIVEPACKET.COUNTER is not null
+    )
 
-SELECT * FROM DateIncome
+select *
+from dateincome
